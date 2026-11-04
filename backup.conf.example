@@ -1,0 +1,31 @@
+# =============================================================================
+# Configuración de ejemplo para backup.sh (Proxmox VE USB Backup)
+# Copia este archivo a 'backup.conf' o deja que el script lo genere automáticamente.
+# =============================================================================
+
+# Identificador único (UUID) de la partición del disco USB externo (ej: blkid)
+USB_UUID=""
+
+# Punto de montaje local para el disco USB
+MOUNTPOINT="/media/backup"
+
+# Política de retención: número de copias a conservar por cada VM/LXC/Host
+KEEP_LAST=3
+
+# Espacio libre mínimo de seguridad requerido en el USB (en GiB)
+MIN_FREE_GB=20
+
+# Rendimiento y exclusiones
+ZSTD_THREADS=0       # 0 = automático de vzdump, >0 = número de hilos CPU
+BWLIMIT=70000        # Límite I/O en KiB/s (70000 = ~70 MB/s, 0 = sin límite)
+BLACKLIST_VMS=""     # IDs separados por comas a excluir siempre (ej: "105,106")
+
+# Notificaciones Telegram (0 = desactivado, 1 = activado)
+TELEGRAM_ENABLED=0
+TELEGRAM_BOT_TOKEN=""
+TELEGRAM_CHAT_ID=""
+
+# Notificaciones nativas Proxmox VE (0 = desactivado, 1 = activado)
+EMAIL_ENABLED=1
+EMAIL_NOTIFICATION_TYPE="failure"   # failure | always
+NOTIFICATION_TARGET=""              # Ej: mail-to-root o nombre del destino SMTP en Proxmox

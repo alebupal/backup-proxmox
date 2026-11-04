@@ -1,0 +1,33 @@
+# Configuración local y credenciales sensibles (Telegram Bot Token, Chat ID, UUID)
+backup.conf
+*.conf
+!backup.conf.example
+
+# Archivos de registro (logs) y bloqueos de ejecución
+*.log
+*.lock
+*.pid
+nohup.out
+
+# Archivos de copias de seguridad y sumas de verificación (por si se ejecutan localmente)
+dump/
+proxmox-backups/
+*.vma
+*.vma.zst
+*.vma.gz
+*.vma.lzo
+*.tar.zst
+*.tar.gz
+SHA256SUMS
+
+# Entorno de desarrollo, editores y sistema operativo
+*.code-workspace
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*~
+*.swp
+*.swo
+*.bak
+*.tmp
