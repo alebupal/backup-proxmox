@@ -127,7 +127,7 @@ Al ejecutar `./backup.sh` sin argumentos, si el disco USB ya está configurado y
 
 | Opción | Descripción |
 | :--- | :--- |
-| **1) Lanzar Copia** | Asistente en 2 pasos: primero elige qué respaldar (Todo, Máquinas específicas por ID o solo Host) y luego el modo de ejecución (Primer plano interactivo, Segundo plano con `nohup` o Simulación `--dry-run`). |
+| **1) Lanzar Copia** | Asistente en 2 pasos: primero elige qué respaldar (Todo, Máquinas específicas por ID o solo Host) y luego el modo de ejecución (Primer plano interactivo, Segundo plano con `nohup` o Simulación `--dry-run`). Si la copia en primer plano falla (USB no montable, espacio insuficiente, error inesperado...), se envía la alerta, se libera el bloqueo, se desmonta el USB si lo montó el script y se vuelve al menú en lugar de cerrar el programa. |
 | **2) Detener Copia** | Detiene de forma segura cualquier proceso de backup en segundo plano activo, cancela procesos hijos (`vzdump`, `zstd`), libera bloqueos residuales (`qm unlock` / `pct unlock`) y sincroniza el disco USB. |
 | **3) Restaurar Copia** | Asistente de restauración interactivo con tabla compacta: lista las copias del USB con el nombre de cada VM/LXC y ejecuta `qmrestore` o `pct restore` en el almacenamiento de Proxmox que selecciones. |
 | **4) Calculadora de Espacio** | Analiza disco por disco cada VM/LXC. Identifica discos virtuales y passthrough, mostrando qué discos se van a respaldar y el total de GB requeridos frente al espacio libre del USB. |
@@ -161,7 +161,7 @@ backup.sh [OPCIONES]
 | `--with-host` | Ninguno | Incluye el respaldo del host al usar `--vms`. |
 | `--no-host` | Ninguno | Excluye el respaldo del host al usar `--vms` o `--all`. |
 | `--host-only` | Ninguno | Respalda únicamente la configuración del host Proxmox (omite VMs y LXCs). |
-| `--stop`, `--kill` | Ninguno | Detiene limpiamente el backup lanzado por este script y sus procesos hijos (`vzdump`, `tar`, `zstd`...), libera locks y sincroniza el disco USB. No afecta a otros `vzdump` del host. |
+| `--stop`, `--kill` | Ninguno | Detiene limpiamente el backup lanzado por este script y sus procesos hijos (`vzdump`, `tar`, `zstd`...), libera locks y sincroniza el disco USB. No afecta a otros `vzdump` del host. Sin terminal (cron, `nohup`, tubería) no pregunta: sin `-y` no detiene nada (sale con código `1` si había una copia en curso); con `-y` (en cualquier posición) la detiene sin confirmación. |
 | `--keep` | `<N>` | Sobrescribe temporalmente el número de copias a conservar. |
 | `--uuid` | `<UUID>` | Sobrescribe el UUID del disco USB a utilizar en esta ejecución. |
 | `--zstd` | `<N>` | Define el número de hilos CPU a usar por `zstd` en `vzdump`. |
@@ -362,6 +362,8 @@ EMAIL_ENABLED=1
 EMAIL_NOTIFICATION_TYPE="failure"
 NOTIFICATION_TARGET="mail-to-root"
 ```
+
+Al guardar desde el menú, los valores de texto se escriben entre comillas dobles escapando `\`, `"`, `$` y `` ` `` (sintaxis de bash), de modo que valores con comillas o barras se releen exactamente igual. Si editas el fichero a mano, también se aceptan valores sin comillas (admiten comentarios `# ...` al final) o entre comillas simples.
 
 ---
 
