@@ -20,6 +20,9 @@
 set -Eeuo pipefail
 umask 077
 
+# PATH completo: desde cron solo existe /usr/bin:/bin y no se encontrarían qm, pct, vzdump, blkid...
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin${PATH:+:$PATH}"
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Rutas y Variables Globales
 # ─────────────────────────────────────────────────────────────────────────────
@@ -53,6 +56,9 @@ LOG_FILE=""
 MOUNTED_BY_SCRIPT=0
 FAILED=0
 START_TIME=0
+CONFIG_LOADED=0
+ALERT_SENT=0
+MENU_MODE=0
 
 # Opciones CLI
 CLI_ALL=0
@@ -67,7 +73,6 @@ CLI_BACKGROUND=0
 RED=$'\033[0;31m'
 GREEN=$'\033[0;32m'
 YELLOW=$'\033[1;33m'
-BLUE=$'\033[0;34m'
 CYAN=$'\033[0;36m'
 MAGENTA=$'\033[0;35m'
 BOLD=$'\033[1m'
@@ -119,7 +124,8 @@ ui_progress_bar() {
 # Funciones de Logging y Ayuda
 # ─────────────────────────────────────────────────────────────────────────────
 log() {
-    local raw_msg="[$(date '+%F %T')] $*"
+    local raw_msg
+    raw_msg="[$(date '+%F %T')] $*"
     # Salida por pantalla con colores interpretados
     printf '%b\n' "$raw_msg"
     # Log local persistente en la carpeta del script (sin códigos ANSI)
@@ -146,7 +152,8 @@ log_err() {
 
 abort() {
     log_err "$*"
-    send_notifications_alert "❌ <b>Error Crítico en Backup Proxmox VE</b>%0A%0A• <b>Host:</b> $(hostname)%0A• <b>Motivo:</b> $*"
+    send_notifications_alert "❌ <b>Error Crítico en Backup Proxmox VE</b>%0A%0A• <b>Host:</b> $(html_escape "$(hostname)")%0A• <b>Motivo:</b> $(html_escape "$*")"
+    ALERT_SENT=1
     exit 1
 }
 
@@ -179,7 +186,55 @@ ask_yes_no() {
 # ─────────────────────────────────────────────────────────────────────────────
 # Carga y Guardado de Configuración Persistente (backup.conf en $SCRIPT_DIR)
 # ─────────────────────────────────────────────────────────────────────────────
+# Extrae el valor de una línea KEY=valor: respeta comillas (incluido '#' dentro de ellas)
+# y elimina los comentarios en línea ("valor   # comentario") de los valores sin comillas.
+parse_conf_value() {
+    local v="$1"
+    v="${v%$'\r'}"
+    v="${v#"${v%%[![:space:]]*}"}"
+    if [[ "$v" == \"* ]]; then
+        v="${v#\"}"
+        v="${v%%\"*}"
+    elif [[ "$v" == \'* ]]; then
+        v="${v#\'}"
+        v="${v%%\'*}"
+    else
+        v="$(printf '%s' "$v" | sed -E 's/[[:space:]]+#.*$//')"
+        v="${v%"${v##*[![:space:]]}"}"
+    fi
+    printf '%s' "$v"
+}
+
+# Valida los ajustes numéricos/enumerados (de backup.conf o de la CLI); si no son válidos, usa el valor por defecto
+validate_settings() {
+    local var def
+    for var in KEEP_LAST:3 MIN_FREE_GB:20 ZSTD_THREADS:0 BWLIMIT:70000 EMAIL_ENABLED:1 TELEGRAM_ENABLED:0; do
+        def="${var#*:}"
+        var="${var%%:*}"
+        if [[ ! "${!var}" =~ ^[0-9]+$ ]]; then
+            log_warn "Valor no válido para $var ('${!var}'). Se usará el valor por defecto: $def"
+            printf -v "$var" '%s' "$def"
+        fi
+    done
+    if [[ "$EMAIL_NOTIFICATION_TYPE" != "failure" && "$EMAIL_NOTIFICATION_TYPE" != "always" ]]; then
+        log_warn "Valor no válido para EMAIL_NOTIFICATION_TYPE ('$EMAIL_NOTIFICATION_TYPE'). Se usará: failure"
+        EMAIL_NOTIFICATION_TYPE="failure"
+    fi
+    if [[ -n "$BLACKLIST_VMS" && ! "$BLACKLIST_VMS" =~ ^[0-9,[:space:]]+$ ]]; then
+        log_warn "Valor no válido para BLACKLIST_VMS ('$BLACKLIST_VMS'). Se ignorará la lista negra."
+        BLACKLIST_VMS=""
+    fi
+    return 0
+}
+
+# Carga backup.conf una sola vez por ejecución (los overrides de CLI se aplican después y no se pisan).
+# Usa 'load_config --force' para releer el fichero explícitamente.
 load_config() {
+    if [[ "$CONFIG_LOADED" -eq 1 && "${1:-}" != "--force" ]]; then
+        return 0
+    fi
+    CONFIG_LOADED=1
+
     # Migración/compatibilidad automática si existía la configuración en otra ruta previa
     if [[ ! -f "$CONFIG_FILE" ]]; then
         if [[ -f /root/backup.conf && "$CONFIG_FILE" != "/root/backup.conf" ]]; then
@@ -194,7 +249,7 @@ load_config() {
             [[ "$key" =~ ^[[:space:]]*# ]] && continue
             [[ -z "$key" ]] && continue
             key="$(echo "$key" | tr -d ' ')"
-            val="$(echo "$val" | sed -e 's/^[[:space:]]*["'\'']//' -e 's/["'\''][[:space:]]*$//')"
+            val="$(parse_conf_value "$val")"
             case "$key" in
                 USB_UUID) USB_UUID="$val" ;;
                 MOUNTPOINT) MOUNTPOINT="$val" ;;
@@ -227,6 +282,8 @@ load_config() {
         [[ -z "$found_target" ]] && found_target="$(grep -E '^(smtp|sendmail):' /etc/pve/notifications.cfg 2>/dev/null | awk '{print $2}' | head -n1 || true)"
         [[ -n "$found_target" ]] && NOTIFICATION_TARGET="$found_target"
     fi
+
+    validate_settings
 }
 
 save_config() {
@@ -261,16 +318,29 @@ EOF
 # ─────────────────────────────────────────────────────────────────────────────
 # Módulo de Notificaciones (Telegram y Email)
 # ─────────────────────────────────────────────────────────────────────────────
+# Escapa &, < y > para insertar texto dinámico en mensajes con parse_mode=HTML
+html_escape() {
+    printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'
+}
+
 send_telegram_message() {
     local text="$1"
-    load_config
     if [[ "$TELEGRAM_ENABLED" -ne 1 || -z "$TELEGRAM_BOT_TOKEN" || -z "$TELEGRAM_CHAT_ID" ]]; then
         return 0
     fi
-    curl -s -m 10 -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
-        -d "chat_id=${TELEGRAM_CHAT_ID}" \
-        -d "parse_mode=HTML" \
-        -d "text=${text}" >/dev/null 2>&1 || true
+    # Los mensajes usan %0A como salto de línea; se convierten a saltos reales porque --data-urlencode codifica todo
+    text="${text//%0A/$'\n'}"
+    # El token se pasa a curl por stdin (-K -) para que no aparezca en la línea de comandos (ps)
+    local curl_out curl_rc=0
+    curl_out="$(printf 'url = "https://api.telegram.org/bot%s/sendMessage"\n' "$TELEGRAM_BOT_TOKEN" |
+        curl -sS -f -m 10 -K - \
+            --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
+            --data-urlencode "parse_mode=HTML" \
+            --data-urlencode "text=${text}" 2>&1 >/dev/null)" || curl_rc=$?
+    if [[ "$curl_rc" -ne 0 ]]; then
+        log_warn "No se pudo enviar la notificación de Telegram (curl código $curl_rc): ${curl_out//"$TELEGRAM_BOT_TOKEN"/[token]}"
+    fi
+    return 0
 }
 
 send_notifications_alert() {
@@ -301,9 +371,10 @@ discover_guests() {
         GUEST_STATUS["$vmid"]="$status"
     done < <(qm list 2>/dev/null | tail -n +2 || true)
 
-    # Descubrir Contenedores (LXC)
-    while read -r vmid status lock name rest; do
+    # Descubrir Contenedores (LXC). La columna Lock puede ir vacía: el nombre es siempre el último campo
+    while read -r vmid status rest; do
         [[ "$vmid" =~ ^[0-9]+$ ]] || continue
+        local name="${rest##* }"
         ALL_GUEST_IDS+=("$vmid")
         GUEST_TYPES["$vmid"]="LXC"
         GUEST_NAMES["$vmid"]="$name"
@@ -332,6 +403,29 @@ get_guest_config() {
             pct config "$gid" 2>/dev/null || true
         fi
     fi
+}
+
+# Sección principal de un .conf de Proxmox (antes del primer [snapshot] / [PENDING])
+conf_main_section() {
+    awk '/^\[/{exit} {print}' "$1" 2>/dev/null || true
+}
+
+# Discos passthrough (/dev/...) de la sección principal que aún no tienen backup=0
+# (solo claves de disco: scsi/virtio/sata/ide en VMs y mpN en LXC; nunca serialN, devN, etc.)
+conf_passthrough_without_backup0() {
+    conf_main_section "$1" | grep -E '^(scsi|virtio|sata|ide|mp)[0-9]+:[[:space:]]*/dev/' | grep -v -E 'backup=(0|no)' || true
+}
+
+# Marca backup=0 en el disco <clave> SOLO en la sección principal (sustituye un backup=X previo o lo añade al final)
+conf_disk_backup_off() {
+    local conf_file="$1" key="$2"
+    sed -i -E "0,/^\[/{/^${key}:/{s/,backup=[^,]*/,backup=0/;t;s/\$/,backup=0/}}" "$conf_file"
+}
+
+# Quita backup=0/no del disco <clave> SOLO en la sección principal, sin tocar el resto de opciones
+conf_disk_backup_on() {
+    local conf_file="$1" key="$2"
+    sed -i -E "0,/^\[/{/^${key}:/s/,backup=(0|no)(,|\$)/\2/}" "$conf_file"
 }
 
 parse_disk_size_gb() {
@@ -474,7 +568,9 @@ prune_old_backups() {
         fi
     done
 
-    mapfile -t host_files < <(find "$backup_path" -maxdepth 1 \( -name "proxmox-host-config-*.tar.gz" -o -name "pve-host-backup-*.tar.gz" \) 2>/dev/null | sort -r)
+    # Ordenar por fecha de modificación (más reciente primero): por nombre, los antiguos 'pve-host-*'
+    # quedarían por delante de los 'proxmox-host-*' nuevos y se borrarían las copias recientes
+    mapfile -t host_files < <(find "$backup_path" -maxdepth 1 \( -name "proxmox-host-config-*.tar.gz" -o -name "pve-host-backup-*.tar.gz" \) -printf '%T@ %p\n' 2>/dev/null | sort -rn | cut -d' ' -f2-)
     local total_h=${#host_files[@]}
     if (( total_h > keep )); then
         for (( i=keep; i<total_h; i++ )); do
@@ -513,40 +609,51 @@ mount_usb_device() {
     local fstype
     fstype="$(blkid -s TYPE -o value "$real_device" || true)"
 
-    mkdir -p "$MOUNTPOINT"
+    mkdir -p "$MOUNTPOINT" || return 1
 
     # Si ya estaba montado, verificar si coincide
+    local already_mounted=0
     if mountpoint -q "$MOUNTPOINT"; then
         local current_src
         current_src="$(readlink -f "$(findmnt -n -o SOURCE --target "$MOUNTPOINT" 2>/dev/null || true)")"
         if [[ "$current_src" == "$real_device" ]]; then
-            return 0
-        else
-            umount -l "$MOUNTPOINT" 2>/dev/null || true
+            already_mounted=1
+        elif ! umount "$MOUNTPOINT" 2>/dev/null; then
+            # Otro dispositivo ocupa el punto de montaje: no se fuerza (umount -l) para no romper su uso
+            log_err "El punto de montaje $MOUNTPOINT está ocupado por otro dispositivo ($current_src) y no se pudo desmontar."
+            return 1
         fi
     fi
 
-    if [[ "$fstype" == "exfat" ]]; then
-        mount -t exfat -o rw,iocharset=utf8 "$dev_path" "$MOUNTPOINT"
-    else
-        mount -o rw "$dev_path" "$MOUNTPOINT"
+    if [[ "$already_mounted" -eq 0 ]]; then
+        if [[ "$fstype" == "exfat" ]]; then
+            mount -t exfat -o rw,iocharset=utf8 "$dev_path" "$MOUNTPOINT" || return 1
+        else
+            mount -o rw "$dev_path" "$MOUNTPOINT" || return 1
+        fi
+        # Comprobación explícita: si no quedó montado, los backups irían al disco raíz
+        mountpoint -q "$MOUNTPOINT" || return 1
+        MOUNTED_BY_SCRIPT=1
     fi
-    MOUNTED_BY_SCRIPT=1
 
     # Asegurar directorio dump nativo de Proxmox VE
-    mkdir -p "$MOUNTPOINT/dump"
+    mkdir -p "$MOUNTPOINT/dump" || return 1
     # Sincronizar automáticamente copias previas de proxmox-backups a dump/ para que Proxmox las liste
     if [[ -d "$MOUNTPOINT/proxmox-backups" ]]; then
         find "$MOUNTPOINT/proxmox-backups" -type f \( -name "vzdump-*" -o -name "*host-backup*" -o -name "*host-config*" \) -exec mv -n {} "$MOUNTPOINT/dump/" \; 2>/dev/null || true
     fi
 
-    # Verificación de escritura
-    touch "$MOUNTPOINT/.backup-write-test-$$" 2>/dev/null && rm -f "$MOUNTPOINT/.backup-write-test-$$"
+    # Verificación de escritura (un USB montado en solo lectura se considera un fallo)
+    if ! touch "$MOUNTPOINT/.backup-write-test-$$" 2>/dev/null; then
+        log_err "El disco USB montado en $MOUNTPOINT no admite escritura (¿solo lectura o sistema de archivos dañado?)."
+        return 1
+    fi
+    rm -f "$MOUNTPOINT/.backup-write-test-$$"
     return 0
 }
 
 cleanup_mount() {
-    local rc=$?
+    local rc="${1:-$?}"
     trap - EXIT
 
     if [[ "$MOUNTED_BY_SCRIPT" -eq 1 ]]; then
@@ -558,59 +665,125 @@ cleanup_mount() {
     exit "$rc"
 }
 
+# ¿Está montado en $MOUNTPOINT precisamente el USB configurado (USB_UUID)?
+is_our_usb_mounted() {
+    [[ -n "$USB_UUID" ]] && mountpoint -q "$MOUNTPOINT" 2>/dev/null || return 1
+    local want cur
+    want="$(readlink -f "/dev/disk/by-uuid/$USB_UUID" 2>/dev/null || true)"
+    cur="$(readlink -f "$(findmnt -n -o SOURCE --target "$MOUNTPOINT" 2>/dev/null || true)" 2>/dev/null || true)"
+    [[ -n "$want" && "$cur" == "$want" ]]
+}
+
+# Libera el bloqueo del motor: borra el PID guardado (evita que --stop actúe sobre un PID reutilizado) y cierra el fd 200
+release_backup_lock() {
+    if { true >&200; } 2>/dev/null; then
+        : > "$LOCK_FILE" 2>/dev/null || true
+        exec 200>&-
+    fi
+    return 0
+}
+
+# Comprueba que no haya una copia en curso antes de operaciones destructivas (desmontar, formatear, purgar, borrar)
+ensure_no_backup_running() {
+    if [[ -e "$LOCK_FILE" ]] && ! flock -n "$LOCK_FILE" true 2>/dev/null; then
+        echo -e "${RED}ERROR: Hay una copia de seguridad en curso (bloqueo activo en $LOCK_FILE).${NC}"
+        echo -e "Espera a que termine o detenla (opción 2 del menú o --stop) antes de ${1:-realizar esta operación}."
+        return 1
+    fi
+    return 0
+}
+
+# Trap EXIT del motor: si la ejecución termina con error (set -e, señal, exit inesperado) envía alerta,
+# libera el bloqueo y desmonta el USB solo si lo montó el script
+engine_exit_handler() {
+    local rc=$?
+    trap - EXIT
+    if [[ "$rc" -ne 0 && "$ALERT_SENT" -eq 0 ]]; then
+        ALERT_SENT=1
+        log_err "La copia de seguridad terminó de forma inesperada (código $rc)."
+        send_notifications_alert "❌ <b>Backup Proxmox VE interrumpido</b>%0A%0A• <b>Host:</b> $(html_escape "$(hostname)")%0A• <b>Código de salida:</b> $rc%0A• <b>Revisa log:</b> <code>$(html_escape "$HOST_LOG_FILE")</code>"
+    fi
+    release_backup_lock
+    cleanup_mount "$rc"
+}
+
+# Fin normal del motor: libera el bloqueo y deja como trap solo el desmontaje (sin alerta) para la salida del script
+engine_finish() {
+    release_backup_lock
+    trap cleanup_mount EXIT
+}
+
+# Prueba de integridad de un archivo comprimido según su extensión (0 = correcto o formato sin prueba disponible)
+test_archive_file() {
+    local f="$1" rc=0
+    case "$f" in
+        *.zst) zstd -t "$f" >/dev/null 2>&1 || rc=$? ;;
+        *.tar.gz|*.tgz) tar -tzf "$f" >/dev/null 2>&1 || rc=$? ;;
+        *.gz) gzip -t "$f" >/dev/null 2>&1 || rc=$? ;;
+        *.lzo)
+            if command -v lzop >/dev/null 2>&1; then
+                lzop -t "$f" >/dev/null 2>&1 || rc=$?
+            fi
+            ;;
+    esac
+    return "$rc"
+}
+
 # ─────────────────────────────────────────────────────────────────────────────
 # CONTROL DE PROCESOS EN SEGUNDO PLANO Y DESBLOQUEO DE PROXMOX
 # ─────────────────────────────────────────────────────────────────────────────
+# ¿El PID corresponde a una instancia de este script? (comprobación exacta de argv, no por subcadena)
+is_backup_script_pid() {
+    local pid="$1" arg
+    [[ "$pid" =~ ^[0-9]+$ && -r "/proc/$pid/cmdline" ]] || return 1
+    while IFS= read -r -d '' arg; do
+        case "${arg##*/}" in
+            backup.sh|backup-proxmox-usb.sh) return 0 ;;
+        esac
+    done 2>/dev/null < "/proc/$pid/cmdline"
+    return 1
+}
+
+# Lista recursiva de descendientes de un PID (vzdump, tar, zstd... lanzados por el backup)
+get_descendant_pids() {
+    local child
+    for child in $(pgrep -P "$1" 2>/dev/null || true); do
+        echo "$child"
+        get_descendant_pids "$child"
+    done
+}
+
 get_running_backup_pids() {
     local my_pid=$$
     local my_bashpid=$BASHPID
     local my_ppid=$PPID
-    local pids=()
+    local roots=() pids=() p c
 
-    # 1. PIDs mediante fuser o contenido de LOCK_FILE
-    if [[ -f "$LOCK_FILE" ]]; then
-        local f_pids
-        f_pids="$(fuser "$LOCK_FILE" 2>/dev/null || true)"
-        for p in $f_pids; do
-            [[ -z "$p" ]] && continue
-            [[ "$p" == "$my_pid" || "$p" == "$my_bashpid" || "$p" == "$my_ppid" ]] && continue
-            pids+=("$p")
-        done
-        local saved_pid
-        saved_pid="$(head -n 1 "$LOCK_FILE" 2>/dev/null || true)"
-        if [[ "$saved_pid" =~ ^[0-9]+$ && "$saved_pid" != "$my_pid" && "$saved_pid" != "$my_bashpid" && "$saved_pid" != "$my_ppid" ]]; then
-            if kill -0 "$saved_pid" 2>/dev/null; then
-                pids+=("$saved_pid")
-            fi
-        fi
+    [[ -f "$LOCK_FILE" ]] || return 0
+
+    # 1. Procesos que mantienen abierto el fichero de bloqueo (la instancia activa y los hijos que heredan el fd)
+    for p in $(fuser "$LOCK_FILE" 2>/dev/null || true); do
+        roots+=("$p")
+    done
+    # 2. PID guardado en LOCK_FILE, solo si sigue siendo realmente una instancia de este script
+    local saved_pid
+    saved_pid="$(head -n 1 "$LOCK_FILE" 2>/dev/null || true)"
+    if is_backup_script_pid "$saved_pid"; then
+        roots+=("$saved_pid")
     fi
 
-    # 2. PIDs de instancias de backup.sh / backup-proxmox-usb.sh
-    while read -r p; do
-        [[ -z "$p" ]] && continue
-        [[ "$p" == "$my_pid" || "$p" == "$my_bashpid" || "$p" == "$my_ppid" ]] && continue
-        # Verificar que no sea hijo ni subshell del proceso actual
-        local p_parent
-        p_parent="$(ps -o ppid= -p "$p" 2>/dev/null | tr -d ' ')"
-        [[ "$p_parent" == "$my_pid" || "$p_parent" == "$my_bashpid" ]] && continue
-
-        local cmdline
-        cmdline="$(ps -p "$p" -o cmd= 2>/dev/null || true)"
-        [[ "$cmdline" =~ (--stop|--kill|-h|--help) ]] && continue
-        if [[ "$cmdline" =~ backup(\.sh|-proxmox-usb\.sh) ]]; then
-            pids+=("$p")
-        fi
-    done < <(pgrep -f "backup(\.sh|-proxmox-usb\.sh)" 2>/dev/null || true)
-
-    # 3. PIDs de vzdump
-    while read -r p; do
-        [[ -z "$p" ]] && continue
+    # 3. Solo esos procesos y sus descendientes: nunca otros vzdump o procesos ajenos del host
+    for p in "${roots[@]}"; do
+        [[ "$p" =~ ^[0-9]+$ ]] || continue
         [[ "$p" == "$my_pid" || "$p" == "$my_bashpid" || "$p" == "$my_ppid" ]] && continue
         pids+=("$p")
-    done < <(pgrep -f "(^|/)vzdump" 2>/dev/null || true)
+        while read -r c; do
+            [[ -n "$c" && "$c" != "$my_pid" && "$c" != "$my_bashpid" ]] && pids+=("$c")
+        done < <(get_descendant_pids "$p")
+    done
 
     if [[ ${#pids[@]} -gt 0 ]]; then
-        printf "%s\n" "${pids[@]}" | sort -u | tr '\n' ' ' | sed 's/ $//'
+        printf "%s\n" "${pids[@]}" | sort -un | tr '\n' ' ' | sed 's/ $//'
     fi
 }
 
@@ -628,11 +801,14 @@ get_active_backup_detail() {
     local current_task=""
 
     # 1. ¿Está vzdump ejecutándose activamente?
-    local v_cmd
-    v_cmd="$(ps -C vzdump -o args= 2>/dev/null | head -n 1 || true)"
-    if [[ -z "$v_cmd" ]]; then
-        v_cmd="$(pgrep -a -f "(^|/)vzdump" 2>/dev/null | head -n 1 || true)"
-    fi
+    local v_cmd="" v_pid v_args
+    for v_pid in $pids_str; do
+        v_args="$(ps -p "$v_pid" -o args= 2>/dev/null || true)"
+        if [[ "$v_args" =~ (^|/|[[:space:]])vzdump([[:space:]]|$) ]]; then
+            v_cmd="$v_args"
+            break
+        fi
+    done
 
     if [[ -n "$v_cmd" ]]; then
         local vmid
@@ -693,6 +869,11 @@ get_active_backup_detail() {
 
 unlock_all_guests_safe() {
     echo -e "${CYAN}Comprobando bloqueos residuales en Proxmox (qm/pct unlock)...${NC}"
+    # Si sigue activo algún vzdump (ajeno a este script, p. ej. un job de la GUI), sus 'lock: backup' son legítimos
+    if pgrep -f 'vzdump' >/dev/null 2>&1; then
+        echo -e "${YELLOW}⚠️ Hay otro proceso vzdump en ejecución (ajeno a este script): no se liberan bloqueos para no interferir.${NC}"
+        return 0
+    fi
     local unlocked=0
     # VMs
     while read -r vmid name status rest; do
@@ -704,9 +885,10 @@ unlock_all_guests_safe() {
         fi
     done < <(qm list 2>/dev/null | tail -n +2 || true)
 
-    # LXCs
-    while read -r vmid status lock name rest; do
+    # LXCs (la columna Lock puede ir vacía: el nombre es el último campo)
+    while read -r vmid status rest; do
         [[ "$vmid" =~ ^[0-9]+$ ]] || continue
+        local name="${rest##* }"
         if pct config "$vmid" 2>/dev/null | grep -q "^lock:[[:space:]]*backup"; then
             echo -e "  ${YELLOW}• Liberando bloqueo en LXC $vmid ($name)...${NC}"
             pct unlock "$vmid" 2>/dev/null || true
@@ -797,8 +979,8 @@ stop_running_backup() {
         fi
     done
 
-    # Liberar el archivo de bloqueo
-    rm -f "$LOCK_FILE" 2>/dev/null || true
+    # Vaciar el PID guardado en el bloqueo (no se borra el fichero para no romper flock)
+    : > "$LOCK_FILE" 2>/dev/null || true
 
     # Liberar bloqueos residuales en Proxmox
     echo
@@ -807,7 +989,8 @@ stop_running_backup() {
     # Sincronizar escrituras pendientes y desmontar USB de forma segura
     echo -e "\n${CYAN}2. Sincronizando escrituras pendientes a disco (sync)...${NC}"
     sync 2>/dev/null || true
-    if mountpoint -q "$MOUNTPOINT" 2>/dev/null; then
+    # Solo se desmonta si en $MOUNTPOINT está el USB configurado (nunca otro dispositivo)
+    if is_our_usb_mounted; then
         echo -e "${CYAN}3. Desmontando almacenamiento USB de forma segura...${NC}"
         umount "$MOUNTPOINT" 2>/dev/null || umount -l "$MOUNTPOINT" 2>/dev/null || true
     fi
@@ -929,6 +1112,10 @@ menu_select_usb() {
         USB_UUID="$new_uuid"
         save_config
         echo -e "${GREEN}✓ UUID actualizado con éxito a: $USB_UUID${NC}"
+        if ! ensure_no_backup_running "cambiar el disco montado"; then
+            pause_prompt
+            return
+        fi
         if ask_yes_no "¿Deseas montar este disco USB en $MOUNTPOINT ahora mismo?" "s"; then
             umount "$MOUNTPOINT" 2>/dev/null || true
             if mount_usb_device; then
@@ -948,6 +1135,7 @@ test_backup_integrity() {
 
     # Soporte si se pasa un archivo individual (vía dump/)
     if [[ -f "$target" ]]; then
+        local file_sha_failed=0
         local bdir
         bdir="$(dirname "$target")"
         local aname
@@ -966,6 +1154,7 @@ test_backup_integrity() {
                 echo -e "${GREEN}CORRECTO [OK]${NC}"
             else
                 echo -e "${RED}CORRUPTO [FALLÓ]${NC}"
+                file_sha_failed=1
             fi
             echo
         fi
@@ -973,18 +1162,14 @@ test_backup_integrity() {
         echo -e "${CYAN}2. Comprobando descompresión de bloques de datos...${NC}"
         echo -n "  • Probando streaming de $aname... "
         local t_rc=0
-        if [[ "$aname" == *.zst ]]; then
-            zstd -t "$target" >/dev/null 2>&1 || t_rc=$?
-        elif [[ "$aname" == *.tar.gz || "$aname" == *.tgz ]]; then
-            tar -tzf "$target" >/dev/null 2>&1 || t_rc=$?
-        elif [[ "$aname" == *.gz ]]; then
-            gzip -t "$target" >/dev/null 2>&1 || t_rc=$?
-        fi
+        test_archive_file "$target" || t_rc=$?
 
         echo
         ui_hr
-        if [[ "$t_rc" -eq 0 ]]; then
+        if [[ "$t_rc" -eq 0 && "$file_sha_failed" -eq 0 ]]; then
             echo -e "${GREEN}${BOLD}✓ Resultado: El archivo está 100% íntegro y sin errores de lectura/descompresión.${NC}"
+        elif [[ "$t_rc" -eq 0 ]]; then
+            echo -e "${RED}${BOLD}❌ Resultado: La suma SHA-256 no coincide con la registrada. El archivo ha cambiado o está corrupto.${NC}"
         else
             echo -e "${RED}${BOLD}❌ Resultado: Error de integridad (Código: $t_rc). El archivo puede estar corrupto o incompleto.${NC}"
         fi
@@ -996,9 +1181,9 @@ test_backup_integrity() {
     sync_sha256sums "$bdir"
 
     # 1. Comprobar si existe SHA256SUMS
+    local sha_failed=0
     if [[ -f "$bdir/SHA256SUMS" ]]; then
         echo -e "${CYAN}1. Comprobando sumas SHA-256 registradas al momento del backup...${NC}"
-        local sha_failed=0
         while read -r line; do
             local expected_hash f_name
             expected_hash="$(echo "$line" | awk '{print $1}')"
@@ -1034,6 +1219,9 @@ test_backup_integrity() {
 
     if [[ ${#archives[@]} -eq 0 ]]; then
         echo "No se encontraron archivos comprimidos en este directorio."
+        if [[ "$sha_failed" -ne 0 ]]; then
+            echo -e "${RED}${BOLD}❌ Resultado: Hay sumas SHA-256 que no coinciden o archivos registrados que faltan.${NC}"
+        fi
         return
     fi
 
@@ -1043,14 +1231,7 @@ test_backup_integrity() {
         aname="$(basename "$arch")"
         echo -n "  • Probando integridad de $aname... "
         local t_rc=0
-
-        if [[ "$aname" == *.zst ]]; then
-            zstd -t "$arch" >/dev/null 2>&1 || t_rc=$?
-        elif [[ "$aname" == *.tar.gz || "$aname" == *.tgz ]]; then
-            tar -tzf "$arch" >/dev/null 2>&1 || t_rc=$?
-        elif [[ "$aname" == *.gz ]]; then
-            gzip -t "$arch" >/dev/null 2>&1 || t_rc=$?
-        fi
+        test_archive_file "$arch" || t_rc=$?
 
         if [[ "$t_rc" -eq 0 ]]; then
             echo -e "${GREEN}${BOLD}✓ ÍNTEGRO (Sin errores de bloques)${NC}"
@@ -1062,11 +1243,13 @@ test_backup_integrity() {
 
     echo
     ui_hr
-    if [[ "$corrupted_count" -eq 0 ]]; then
+    if [[ "$corrupted_count" -eq 0 && "$sha_failed" -eq 0 ]]; then
         echo -e "${GREEN}${BOLD}✓ Resultado: Todos los archivos de esta copia están 100% sanos e íntegros.${NC}"
     else
-        echo -e "${RED}${BOLD}❌ Resultado: Se encontraron $corrupted_count archivo(s) corrupto(s) en esta copia.${NC}"
+        [[ "$corrupted_count" -gt 0 ]] && echo -e "${RED}${BOLD}❌ Resultado: Se encontraron $corrupted_count archivo(s) corrupto(s) en esta copia.${NC}"
+        [[ "$sha_failed" -ne 0 ]] && echo -e "${RED}${BOLD}❌ Resultado: Hay sumas SHA-256 que no coinciden o archivos registrados que faltan.${NC}"
     fi
+    return 0
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1102,8 +1285,8 @@ menu_manage_backups() {
         local count=${#BACKUPS[@]}
         local df_line
         df_line="$(df -Pk "$MOUNTPOINT" 2>/dev/null | awk 'NR==2 {print $2, $3, $4, $5}')"
-        local tot_kb used_kb free_kb used_pct
-        read -r tot_kb used_kb free_kb used_pct <<< "${df_line:-0 0 0 0%}"
+        local tot_kb free_kb used_pct
+        read -r tot_kb _ free_kb used_pct <<< "${df_line:-0 0 0 0%}"
         used_pct="${used_pct%%%}"
         local free_gb=$((free_kb / 1024 / 1024))
         local tot_gb=$((tot_kb / 1024 / 1024))
@@ -1200,6 +1383,10 @@ menu_manage_backups() {
                 fi
                 ;;
             c|C)
+                if ! ensure_no_backup_running "purgar copias"; then
+                    pause_prompt
+                    continue
+                fi
                 echo -e "\n${CYAN}Aplicando política de retención (conservar últimas $KEEP_LAST copias por guest/host)...${NC}"
                 prune_old_backups "$backup_path" "$KEEP_LAST" 0
                 echo -e "${GREEN}✓ Limpieza completada y SHA256SUMS sincronizado.${NC}"
@@ -1209,6 +1396,10 @@ menu_manage_backups() {
                 local del_idx
                 del_idx="$(echo "$bopt" | awk '{print $2}')"
                 if [[ -n "${BACKUP_MAP[$del_idx]:-}" ]]; then
+                    if ! ensure_no_backup_running "borrar copias"; then
+                        pause_prompt
+                        continue
+                    fi
                     local target_del="${BACKUP_MAP[$del_idx]}"
                     echo -e "\n${RED}⚠️ ¿Estás seguro de eliminar PERMANENTEMENTE la copia $(basename "$target_del")?${NC}"
                     read -rp "Escribe SI para confirmar: " conf_del
@@ -1242,6 +1433,11 @@ menu_format_usb() {
     echo -e "El formateo ${RED}${BOLD}DESTRUIRÁ IRREVERSIBLEMENTE TODOS LOS DATOS${NC} del disco seleccionado."
     echo -e "Asegúrate de haber copiado previamente cualquier archivo importante."
     ui_hr
+
+    if ! ensure_no_backup_running "formatear el disco"; then
+        pause_prompt "Presiona [Enter] para volver..."
+        return
+    fi
 
     load_config
     local dev_path="/dev/disk/by-uuid/$USB_UUID"
@@ -1375,6 +1571,10 @@ menu_mount_umount_usb() {
 
             case "$m_opt" in
                 1)
+                    if ! ensure_no_backup_running "desmontar el USB"; then
+                        pause_prompt
+                        continue
+                    fi
                     echo -e "\n${CYAN}Sincronizando escrituras pendientes a disco...${NC}"
                     sync
                     echo "Desmontando $MOUNTPOINT..."
@@ -1503,7 +1703,6 @@ menu_restore_backup() {
 
     local idx=1
     declare -A ARCHIVE_MAP
-    declare -A ARCHIVE_TYPE
     declare -A ARCHIVE_ORIG_ID
 
     for arch in "${RESTORE_ARCHIVES[@]}"; do
@@ -1542,7 +1741,6 @@ menu_restore_backup() {
             "$idx" "$type_str" "$id_label" "$disp_file" "$bsize" "$bdate"
 
         ARCHIVE_MAP["$idx"]="$arch"
-        ARCHIVE_TYPE["$idx"]="$type_str"
         ARCHIVE_ORIG_ID["$idx"]="$orig_id"
         ((++idx))
     done
@@ -1581,7 +1779,8 @@ menu_restore_backup() {
 
         case "$host_opt" in
             1)
-                local tmp_dest="/tmp/pve-host-restore-preview-$(date +%s)"
+                local tmp_dest
+                tmp_dest="/tmp/pve-host-restore-preview-$(date +%s)"
                 mkdir -p "$tmp_dest"
                 echo "Extrayendo en $tmp_dest..."
                 tar -xzvf "$selected_file" -C "$tmp_dest"
@@ -1777,10 +1976,9 @@ menu_manage_disks() {
                     local disk_id
                     disk_id="$(echo "$dline" | cut -d':' -f1 | tr -d ' ')"
                     echo -e "  • ID $gid (${GUEST_NAMES[$gid]}): Excluyendo ${BOLD}$disk_id${NC} (passthrough)..."
-                    sed -i -E "s|^(${disk_id}:[[:space:]]*/dev/[^,]+)(.*)|\1\2,backup=0|" "$conf_file"
-                    sed -i -E "s/,backup=0.*,backup=0/,backup=0/g" "$conf_file"
+                    conf_disk_backup_off "$conf_file" "$disk_id"
                     ((++modified_count))
-                done < <(grep -E '^[a-z0-9]+:[[:space:]]*/dev/' "$conf_file" 2>/dev/null | grep -v 'backup=0' || true)
+                done < <(conf_passthrough_without_backup0 "$conf_file")
             done
             echo -e "${GREEN}✓ Operación completada. Se protegieron $modified_count disco(s) passthrough.${NC}"
             pause_prompt
@@ -1809,7 +2007,7 @@ menu_manage_disks() {
         while true; do
             ui_header "💽 DISCOS DE $selected_type $selected_gid (${GUEST_NAMES[$selected_gid]})"
 
-            mapfile -t DISK_LINES < <(grep -E "$disk_regex" "$conf_file" 2>/dev/null || true)
+            mapfile -t DISK_LINES < <(conf_main_section "$conf_file" | grep -E "$disk_regex" || true)
 
             if [[ ${#DISK_LINES[@]} -eq 0 ]]; then
                 echo "No se encontraron discos definidos en este elemento."
@@ -1858,13 +2056,12 @@ menu_manage_disks() {
 
             if [[ -n "$target_key" ]]; then
                 local current_line
-                current_line="$(grep "^${target_key}:" "$conf_file")"
+                current_line="$(conf_main_section "$conf_file" | grep "^${target_key}:" || true)"
                 if [[ "$current_line" =~ backup=(0|no) ]]; then
-                    sed -i -E "s/^(${target_key}:.*),backup=(0|no)(.*)/\1\3/" "$conf_file"
-                    sed -i -E "s/,,/,/g" "$conf_file"
+                    conf_disk_backup_on "$conf_file" "$target_key"
                     echo -e "${GREEN}✓ Disco $target_key marcado como INCLUIDO en el backup.${NC}"
                 else
-                    sed -i -E "s/^(${target_key}:.*)/\1,backup=0/" "$conf_file"
+                    conf_disk_backup_off "$conf_file" "$target_key"
                     echo -e "${YELLOW}✓ Disco $target_key marcado como EXCLUIDO (backup=0).${NC}"
                 fi
                 sleep 1
@@ -2122,11 +2319,28 @@ CRON_TAG="# PROXMOX-USB-BACKUP-AUTO"
 
 get_cron_entry() {
     local cline
-    cline="$(crontab -l 2>/dev/null | grep -F "$CRON_TAG" -A 1 | grep -v "$CRON_TAG" | head -n 1 || true)"
-    if [[ -z "$cline" ]]; then
-        cline="$(crontab -l 2>/dev/null | grep -E 'backup(\.sh|-proxmox-usb\.sh).*--all' | head -n 1 || true)"
-    fi
+    cline="$(crontab -l 2>/dev/null | grep -F "$CRON_TAG" -A 1 | grep -v -F "$CRON_TAG" | head -n 1 || true)"
     echo "$cline"
+}
+
+# Elimina de crontab SOLO la tarea gestionada por este script: la línea CRON_TAG y la orden que la sigue.
+# Las demás entradas (aunque llamen a otros backup.sh) no se tocan.
+# Con un argumento, lo añade como nueva entrada (precedida de CRON_TAG) tras la limpieza.
+replace_cron_entry() {
+    local new_line="${1:-}"
+    local tmp_cron
+    tmp_cron="$(mktemp)"
+    crontab -l 2>/dev/null | awk -v tag="$CRON_TAG" '
+        skip { skip = 0; if ($0 ~ /backup(\.sh|-proxmox-usb\.sh)/) next }
+        index($0, tag) { skip = 1; next }
+        { print }
+    ' > "$tmp_cron" || true
+    if [[ -n "$new_line" ]]; then
+        echo "$CRON_TAG" >> "$tmp_cron"
+        echo "$new_line" >> "$tmp_cron"
+    fi
+    crontab "$tmp_cron"
+    rm -f "$tmp_cron"
 }
 
 format_cron_human() {
@@ -2249,11 +2463,7 @@ menu_cron_schedule() {
                 fi
                 ;;
             5)
-                local tmp_cron
-                tmp_cron="$(mktemp)"
-                crontab -l 2>/dev/null | grep -v "$CRON_TAG" | grep -v -E 'backup(\.sh|-proxmox-usb\.sh).*--all' > "$tmp_cron" || true
-                crontab "$tmp_cron"
-                rm -f "$tmp_cron"
+                replace_cron_entry
                 echo -e "\n${GREEN}✓ Tarea programada eliminada de crontab con éxito.${NC}"
                 sleep 1.5
                 continue
@@ -2264,13 +2474,8 @@ menu_cron_schedule() {
         esac
 
         if [[ -n "$new_cron_exp" ]]; then
-            local tmp_cron
-            tmp_cron="$(mktemp)"
-            crontab -l 2>/dev/null | grep -v "$CRON_TAG" | grep -v -E 'backup(\.sh|-proxmox-usb\.sh).*--all' > "$tmp_cron" || true
-            echo "$CRON_TAG" >> "$tmp_cron"
-            echo "$new_cron_exp $script_bin --all -y >/dev/null 2>&1" >> "$tmp_cron"
-            crontab "$tmp_cron"
-            rm -f "$tmp_cron"
+            # Ruta del script entrecomillada (%q) por si contiene espacios u otros caracteres especiales
+            replace_cron_entry "$(printf '%s %q --all -y >/dev/null 2>&1' "$new_cron_exp" "$script_bin")"
 
             echo -e "\n${GREEN}✓ ¡Tarea programada guardada con éxito en crontab!${NC}"
             echo -e "Horario configurado: ${BOLD}$(format_cron_human "$new_cron_exp")${NC}"
@@ -2682,29 +2887,45 @@ EOF
 execute_backup_engine() {
     load_config
     START_TIME=$SECONDS
+    # Reiniciar el estado de ejecuciones previas (el menú puede lanzar varias copias en la misma sesión)
+    FAILED=0
+    ALERT_SENT=0
+    LOG_FILE=""
 
-    # 1. Protección de concurrencia con flock
-    exec 200>"$LOCK_FILE"
+    # 1. Protección de concurrencia con flock (se abre en modo append para no borrar el PID de otra instancia)
+    exec 200>>"$LOCK_FILE"
     if ! flock -n 200; then
+        exec 200>&-
         echo -e "\n${RED}=====================================================================${NC}"
         echo -e "${RED}${BOLD}ERROR: Ya existe otra instancia de este script ejecutándose.${NC}"
         echo -e "${RED}=====================================================================${NC}"
         echo "Bloqueo activo en: $LOCK_FILE"
+        log_err "No se inicia la copia: ya existe otra instancia en ejecución (bloqueo activo en $LOCK_FILE)."
+        if [[ "$MENU_MODE" -eq 1 ]]; then
+            FAILED=1
+            return 0
+        fi
+        send_notifications_alert "⚠️ <b>Backup Proxmox VE no iniciado</b>%0A%0A• <b>Host:</b> $(html_escape "$(hostname)")%0A• <b>Motivo:</b> ya hay otra copia en ejecución (bloqueo activo)."
+        ALERT_SENT=1
         exit 1
     fi
-    echo "$$" >&200
     echo "$$" > "$LOCK_FILE" 2>/dev/null || true
+    # A partir de aquí cualquier salida con error (set -e, señal...) avisa, libera el bloqueo y desmonta
+    trap engine_exit_handler EXIT
 
-    # 2. Desmontar si estaba montado residualmente
-    if mountpoint -q "$MOUNTPOINT"; then
-        umount "$MOUNTPOINT" 2>/dev/null || umount -l "$MOUNTPOINT" 2>/dev/null || true
+    # 2. Si el USB configurado ya estaba montado (p. ej. desde el menú), remontarlo limpio.
+    #    Nunca se fuerza (umount -l) ni se desmonta otro dispositivo que ocupe $MOUNTPOINT.
+    if is_our_usb_mounted; then
+        umount "$MOUNTPOINT" 2>/dev/null || true
+    fi
+    if ! mountpoint -q "$MOUNTPOINT" 2>/dev/null; then
+        MOUNTED_BY_SCRIPT=0
     fi
 
     # 3. Montar dispositivo USB
     if ! mount_usb_device; then
         abort "No se pudo montar el disco USB con UUID: $USB_UUID. Conéctalo y verifica el dispositivo."
     fi
-    trap cleanup_mount EXIT
 
     # Detección y alerta sobre FAT32 (límite de 4 GiB)
     local rdev fstype
@@ -2744,6 +2965,16 @@ execute_backup_engine() {
             do_host_backup=0
         fi
     elif [[ "$CLI_ALL" -eq 1 ]]; then
+        # 0 guests detectados con --all: distinguir un nodo vacío de un fallo de qm/pct (PATH, cluster...)
+        if [[ ${#ALL_GUEST_IDS[@]} -eq 0 ]]; then
+            if ! command -v qm >/dev/null 2>&1 || ! command -v pct >/dev/null 2>&1; then
+                abort "No se encuentran los comandos qm/pct (PATH=$PATH). No se puede detectar ninguna VM/LXC."
+            elif compgen -G "/etc/pve/qemu-server/*.conf" >/dev/null || compgen -G "/etc/pve/lxc/*.conf" >/dev/null; then
+                abort "--all no ha detectado ninguna VM/LXC aunque existen configuraciones en /etc/pve. Revisa 'qm list' y 'pct list'."
+            else
+                log_warn "No hay VMs ni contenedores LXC en este nodo: solo se respaldará la configuración del host."
+            fi
+        fi
         selected=("${ALL_GUEST_IDS[@]}")
         if [[ "$CLI_INCLUDE_HOST" -eq 0 ]]; then
             do_host_backup=0
@@ -2751,6 +2982,10 @@ execute_backup_engine() {
             do_host_backup=1
         fi
     else
+        # Sin --all/--vms/--host-only hace falta elegir en pantalla: sin terminal (cron, nohup) no es posible
+        if [[ ! -t 0 ]]; then
+            abort "Ejecución no interactiva sin selección de elementos: indica --all, --vms <ids> o --host-only."
+        fi
         ui_header "🎯 SELECCIÓN DE ELEMENTOS A RESPALDAR"
         echo "Elementos detectados en este nodo Proxmox:"
         for gid in "${ALL_GUEST_IDS[@]}"; do
@@ -2826,23 +3061,35 @@ execute_backup_engine() {
         [[ "${GUEST_TYPES[$gid]}" == "LXC" ]] && conf_file="/etc/pve/lxc/${gid}.conf"
         if [[ -f "$conf_file" ]]; then
             local pt_disks
-            pt_disks="$(grep -E '^[a-z0-9]+:[[:space:]]*/dev/' "$conf_file" 2>/dev/null | grep -v '^rootfs:' | grep -v 'backup=0' || true)"
+            pt_disks="$(conf_passthrough_without_backup0 "$conf_file")"
             if [[ -n "$pt_disks" ]]; then
                 echo -e "\n${YELLOW}⚠️ ADVERTENCIA: ${GUEST_TYPES[$gid]} $gid (${GUEST_NAMES[$gid]}) tiene discos passthrough directos sin 'backup=0':${NC}"
                 echo "$pt_disks" | sed 's/^/    /'
                 echo -e "${YELLOW}Si vzdump intenta copiar estos discos mecánicos, el USB se llenará y fallará.${NC}"
-                if ask_yes_no "¿Deseas marcar automáticamente backup=0 en estos discos passthrough para continuar con seguridad?" "s"; then
+                if [[ "$CLI_YES" -eq 1 || "$CLI_DRY_RUN" -eq 1 ]]; then
+                    # Modo desatendido o simulación: nunca se modifica /etc/pve sin confirmación expresa
+                    log_warn "ID $gid tiene discos passthrough sin backup=0; no se modifica su configuración (-y / --dry-run). Usa el menú 'Gestionar Discos y Passthrough'."
+                elif ask_yes_no "¿Deseas marcar automáticamente backup=0 en estos discos passthrough para continuar con seguridad?" "s"; then
                     while read -r dline; do
                         local d_key
                         d_key="$(echo "$dline" | cut -d':' -f1 | tr -d ' ')"
-                        sed -i -E "s|^(${d_key}:[[:space:]]*/dev/[^,]+)(.*)|\1\2,backup=0|" "$conf_file"
-                        sed -i -E "s/,backup=0.*,backup=0/,backup=0/g" "$conf_file"
+                        conf_disk_backup_off "$conf_file" "$d_key"
                     done <<< "$pt_disks"
                     echo -e "${GREEN}✓ Discos passthrough excluidos del backup de ID $gid.${NC}"
                 fi
             fi
         fi
     done
+
+    # 5.1. Estimación orientativa de espacio: tamaño de los discos SIN comprimir (zstd suele ocupar bastante menos),
+    #      por eso solo se avisa; el corte duro sigue siendo MIN_FREE_GB
+    local est_gb=0
+    for gid in "${selected[@]}"; do
+        est_gb=$(( est_gb + $(estimate_guest_disk_gb "$gid") ))
+    done
+    if (( est_gb > free_gb )); then
+        log_warn "Tamaño estimado de los discos a respaldar (~${est_gb} GiB sin comprimir) superior al espacio libre en el USB (${free_gb} GiB). La copia podría no caber."
+    fi
 
     # 6. Directorio de respaldos nativo de Proxmox VE
     local stamp
@@ -2853,11 +3100,12 @@ execute_backup_engine() {
     if [[ "$CLI_DRY_RUN" -eq 1 ]]; then
         echo -e "\n${YELLOW}${BOLD}🧪 MODO SIMULACIÓN (--dry-run): No se escribirán ni borrarán backups en el USB.${NC}"
         echo -e "  • Destino:         $RUN_DIR"
-        echo -e "  • Espacio libre:   ${free_gb} GiB"
+        echo -e "  • Espacio libre:   ${free_gb} GiB (estimación sin comprimir de lo seleccionado: ~${est_gb} GiB)"
         echo -e "  • Incluir Host:    $([ "$do_host_backup" -eq 1 ] && echo "SÍ" || echo "NO")"
         echo -e "  • Máquinas a copiar (${#selected[@]}): ${selected[*]:-Ninguna}"
         echo -e "  • Retención:       Conservar últimas $KEEP_LAST copias"
         prune_old_backups "$RUN_DIR" "$KEEP_LAST" 1
+        engine_finish
         return 0
     fi
 
@@ -2870,6 +3118,7 @@ execute_backup_engine() {
     log_info "Log local sincronizado en: $HOST_LOG_FILE"
 
     declare -a GUEST_SUMMARY_REPORT=()
+    local new_archives=()
 
     # 7. Respaldo de la Configuración del Host
     if [[ "$do_host_backup" -eq 1 ]]; then
@@ -2884,6 +3133,7 @@ execute_backup_engine() {
         local host_tar="$RUN_DIR/proxmox-host-config-${stamp}.tar.gz"
         if tar -czf "$host_tar" -C / "${valid_paths[@]}" 2>>"$LOG_FILE"; then
             chmod 600 "$host_tar" 2>/dev/null || true
+            new_archives+=("$host_tar")
             local hsz
             hsz="$(du -sh "$host_tar" | awk '{print $1}')"
             local htime=$((SECONDS - h_start))
@@ -2964,6 +3214,7 @@ execute_backup_engine() {
             [[ -n "$out_file" && -f "$out_file" ]] && out_sz="$(du -sh "$out_file" 2>/dev/null | awk '{print $1}')"
 
             if [[ "$v_status" -eq 0 ]]; then
+                [[ -n "$out_file" && -f "$out_file" ]] && new_archives+=("$out_file")
                 echo -e "${GREEN}✓ Backup de $gtype $gid completado con éxito ($gname, $out_sz) en $(format_seconds "$gtime").${NC}"
                 log_info "Backup de $gtype $gid completado en $(format_seconds "$gtime") (Tamaño: $out_sz)."
                 GUEST_SUMMARY_REPORT+=("✓ [ID $gid] $gtype $gname | $out_sz | $(format_seconds "$gtime")")
@@ -2976,8 +3227,27 @@ execute_backup_engine() {
         done
     fi
 
+    # 8.1. Verificación de integridad de las copias nuevas ANTES de aplicar la retención
+    local verify_failed=0 new_arch
+    if [[ ${#new_archives[@]} -gt 0 ]]; then
+        echo -e "\n${CYAN}─── Verificando integridad de las copias nuevas (zstd -t / tar -tzf) ───${NC}"
+        log_info "Verificando integridad de ${#new_archives[@]} archivo(s) nuevo(s)..."
+        for new_arch in "${new_archives[@]}"; do
+            if test_archive_file "$new_arch"; then
+                log_info "Integridad verificada: $(basename "$new_arch")"
+            else
+                log_err "Integridad FALLIDA en $(basename "$new_arch"): el archivo puede estar corrupto o incompleto."
+                GUEST_SUMMARY_REPORT+=("✗ [VERIFICACIÓN] $(basename "$new_arch") | CORRUPTO | -")
+                verify_failed=1
+                FAILED=1
+            fi
+        done
+    fi
+
     # 9. Política de retención automática por Guest ID y Host (KEEP_LAST)
-    if [[ "$KEEP_LAST" -gt 0 && -d "$RUN_DIR" ]]; then
+    if [[ "$verify_failed" -eq 1 ]]; then
+        log_warn "Se omite la retención: hay copias nuevas que no superaron la verificación y no se borrarán copias antiguas."
+    elif [[ "$KEEP_LAST" -gt 0 && -d "$RUN_DIR" ]]; then
         echo -e "\n${CYAN}─── Retención: Conservar últimas $KEEP_LAST copias por máquina/host ───${NC}"
         prune_old_backups "$RUN_DIR" "$KEEP_LAST" 0
     fi
@@ -3032,32 +3302,37 @@ execute_backup_engine() {
     # Notificación final por Telegram
     if [[ "$FAILED" -eq 0 ]]; then
         local tg_msg="✅ <b>Backup Proxmox VE Completado</b>%0A%0A"
-        tg_msg+="• <b>Host:</b> $(hostname)%0A"
+        tg_msg+="• <b>Host:</b> $(html_escape "$(hostname)")%0A"
         tg_msg+="• <b>Elementos:</b> ${#selected[@]} VMs/LXCs (+ Host)%0A"
         tg_msg+="• <b>Tamaño en USB:</b> $total_sz%0A"
         tg_msg+="• <b>Espacio libre USB:</b> ${final_free_gb} GiB%0A"
         tg_msg+="• <b>Tiempo total:</b> $(format_seconds "$total_elapsed")%0A"
-        tg_msg+="• <b>Carpeta:</b> <code>$(basename "$RUN_DIR")</code>%0A%0A"
+        tg_msg+="• <b>Carpeta:</b> <code>$(html_escape "$(basename "$RUN_DIR")")</code>%0A%0A"
         tg_msg+="<b>Desglose por elemento:</b>%0A"
         for rep_line in "${GUEST_SUMMARY_REPORT[@]}"; do
-            tg_msg+="• <code>$rep_line</code>%0A"
+            tg_msg+="• <code>$(html_escape "$rep_line")</code>%0A"
         done
         send_telegram_message "$tg_msg"
         log_info "Notificación de éxito enviada a Telegram."
     else
         local tg_err="⚠️ <b>Fallo en Backup Proxmox VE</b>%0A%0A"
-        tg_err+="• <b>Host:</b> $(hostname)%0A"
-        tg_err+="• <b>Estado:</b> Finalizado con errores en vzdump.%0A"
-        tg_err+="• <b>Revisa log:</b> <code>$HOST_LOG_FILE</code>%0A%0A"
+        tg_err+="• <b>Host:</b> $(html_escape "$(hostname)")%0A"
+        tg_err+="• <b>Estado:</b> Finalizado con errores (vzdump, configuración del host o verificación).%0A"
+        tg_err+="• <b>Revisa log:</b> <code>$(html_escape "$HOST_LOG_FILE")</code>%0A%0A"
         tg_err+="<b>Desglose por elemento:</b>%0A"
         for rep_line in "${GUEST_SUMMARY_REPORT[@]}"; do
-            tg_err+="• <code>$rep_line</code>%0A"
+            tg_err+="• <code>$(html_escape "$rep_line")</code>%0A"
         done
         send_telegram_message "$tg_err"
         log_err "Notificación de fallo enviada a Telegram."
+        ALERT_SENT=1
     fi
 
     log_info "Sesión finalizada."
+    engine_finish
+    # El resultado queda en FAILED (no se devuelve como código: el llamador no debe invocar el motor con ||/if,
+    # porque eso desactivaría set -e dentro de él)
+    return 0
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -3214,7 +3489,16 @@ menu_launch_backup() {
             ;;
         2)
             echo -e "\n${CYAN}Preparando e iniciando backup en segundo plano (nohup)...${NC}"
-            umount "$MOUNTPOINT" 2>/dev/null || true
+            if ! ensure_no_backup_running "lanzar otra copia"; then
+                pause_prompt
+                return
+            fi
+            # Desmontar solo si en $MOUNTPOINT está nuestro USB (el proceso hijo lo montará y desmontará al terminar)
+            if is_our_usb_mounted; then
+                umount "$MOUNTPOINT" 2>/dev/null || true
+            fi
+            # El montaje pasa a ser responsabilidad del proceso en segundo plano: el menú no debe desmontarlo al salir
+            MOUNTED_BY_SCRIPT=0
 
             local bg_args=("-y")
             if [[ "$CLI_ALL" -eq 1 ]]; then
@@ -3302,6 +3586,8 @@ init_usb_selection_and_mount() {
     local default_idx=""
 
     for cand in "${candidates[@]}"; do
+        # PKNAME se declara local para que el eval de la salida de lsblk no cree una variable global
+        # shellcheck disable=SC2034
         local NAME="" SIZE="" FSTYPE="" LABEL="" UUID="" TRAN="" MODEL="" TYPE="" PKNAME="" DEV_MOUNTPOINT=""
         eval "${cand//MOUNTPOINT=/DEV_MOUNTPOINT=}"
 
@@ -3347,7 +3633,9 @@ init_usb_selection_and_mount() {
         USB_UUID="$selected_uuid"
         save_config
         echo -e "\n${CYAN}Montando ${MAP_DEV_NAME[$chosen_idx]} ($USB_UUID) en $MOUNTPOINT...${NC}"
-        umount "$MOUNTPOINT" 2>/dev/null || true
+        if ensure_no_backup_running "montar otro disco"; then
+            umount "$MOUNTPOINT" 2>/dev/null || true
+        fi
         if mount_usb_device; then
             MOUNTED_BY_SCRIPT=0
             local free_space
@@ -3559,6 +3847,7 @@ if [[ $# -gt 0 ]]; then
                 fi
                 ;;
             --umount)
+                ensure_no_backup_running "desmontar el USB" || exit 1
                 sync
                 if umount "$MOUNTPOINT" 2>/dev/null || umount -l "$MOUNTPOINT" 2>/dev/null; then
                     echo "✓ Disco USB desmontado con éxito de $MOUNTPOINT"
@@ -3580,10 +3869,7 @@ if [[ $# -gt 0 ]]; then
                 exit 0
                 ;;
             --cron-remove)
-                tmp_cron="$(mktemp)"
-                crontab -l 2>/dev/null | grep -v "$CRON_TAG" | grep -v -E 'backup(\.sh|-proxmox-usb\.sh).*--all' > "$tmp_cron" || true
-                crontab "$tmp_cron"
-                rm -f "$tmp_cron"
+                replace_cron_entry
                 echo "✓ Tarea de backup eliminada de crontab."
                 exit 0
                 ;;
@@ -3600,28 +3886,39 @@ if [[ $# -gt 0 ]]; then
         esac
     done
 
+    # Validar también los valores recibidos por CLI (--keep, --zstd, --bwlimit, --blacklist)
+    validate_settings
+
     if [[ "$CLI_BACKGROUND" -eq 1 ]]; then
-        umount "$MOUNTPOINT" 2>/dev/null || true
-        local bg_args=("-y")
+        ensure_no_backup_running "lanzar otra copia" || exit 1
+        # Desmontar solo si en $MOUNTPOINT está nuestro USB (el proceso hijo lo montará y desmontará al terminar)
+        if is_our_usb_mounted; then
+            umount "$MOUNTPOINT" 2>/dev/null || true
+        fi
+        bg_args=("-y")
         [[ "$CLI_ALL" -eq 1 ]] && bg_args+=("--all")
         [[ "$CLI_HOST_ONLY" -eq 1 ]] && bg_args+=("--host-only")
         [[ -n "$CLI_SELECTED_GUESTS" ]] && bg_args+=("--vms" "$CLI_SELECTED_GUESTS")
         [[ "$CLI_INCLUDE_HOST" -eq 1 ]] && bg_args+=("--with-host")
         [[ "$CLI_INCLUDE_HOST" -eq 0 ]] && bg_args+=("--no-host")
-        [[ "$KEEP_LAST" -ne 3 ]] && bg_args+=("--keep" "$KEEP_LAST")
+        [[ "$CLI_DRY_RUN" -eq 1 ]] && bg_args+=("--dry-run")
+        # Reenviar siempre los ajustes efectivos (backup.conf + overrides de CLI) al proceso en segundo plano
+        bg_args+=("--keep" "$KEEP_LAST" "--zstd" "$ZSTD_THREADS" "--bwlimit" "$BWLIMIT")
+        [[ -n "$USB_UUID" ]] && bg_args+=("--uuid" "$USB_UUID")
         [[ -n "$BLACKLIST_VMS" ]] && bg_args+=("--blacklist" "$BLACKLIST_VMS")
 
         nohup bash "$0" "${bg_args[@]}" >/dev/null 2>&1 &
-        local bg_pid=$!
+        bg_pid=$!
         echo "✓ Proceso lanzado en segundo plano con PID $bg_pid"
         echo "  Comando: bash $0 ${bg_args[*]}"
         exit 0
     else
         execute_backup_engine
-        exit 0
+        exit "$FAILED"
     fi
 else
     # Sin argumentos: Inicializar/montar USB inteligentemente antes de mostrar el menú principal
+    MENU_MODE=1
     init_usb_selection_and_mount
     main_menu
 fi

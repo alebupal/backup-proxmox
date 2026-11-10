@@ -155,25 +155,29 @@ backup.sh [OPCIONES]
 | Bandera | Argumento | Descripción |
 | :--- | :--- | :--- |
 | `-a`, `--all` | Ninguno | Respalda automáticamente todas las VMs, Contenedores LXC y la configuración del Host. |
-| `-y`, `--yes` | Ninguno | Omite cualquier pregunta interactiva (asume respuesta afirmativa 'SÍ'). |
+| `-y`, `--yes` | Ninguno | Omite cualquier pregunta interactiva (asume respuesta afirmativa 'SÍ'). Por seguridad, nunca modifica `/etc/pve` (discos passthrough sin `backup=0`: solo avisa). |
 | `-n`, `--dry-run` | Ninguno | Simula todo el proceso de copia, comandos `vzdump` y purga de retención sin escribir ni borrar datos reales. |
 | `--vms` | `id1,id2,...` | Especifica una lista separada por comas de IDs a respaldar (ej: `--vms 100,104`). |
 | `--with-host` | Ninguno | Incluye el respaldo del host al usar `--vms`. |
 | `--no-host` | Ninguno | Excluye el respaldo del host al usar `--vms` o `--all`. |
 | `--host-only` | Ninguno | Respalda únicamente la configuración del host Proxmox (omite VMs y LXCs). |
-| `--stop`, `--kill` | Ninguno | Detiene limpiamente cualquier proceso de backup en ejecución, libera locks y sincroniza el disco USB. |
+| `--stop`, `--kill` | Ninguno | Detiene limpiamente el backup lanzado por este script y sus procesos hijos (`vzdump`, `tar`, `zstd`...), libera locks y sincroniza el disco USB. No afecta a otros `vzdump` del host. |
 | `--keep` | `<N>` | Sobrescribe temporalmente el número de copias a conservar. |
 | `--uuid` | `<UUID>` | Sobrescribe el UUID del disco USB a utilizar en esta ejecución. |
 | `--zstd` | `<N>` | Define el número de hilos CPU a usar por `zstd` en `vzdump`. |
 | `--bwlimit` | `<KB/s>` | Fija el límite de ancho de banda I/O en KiB/s (ej: `70000` = ~70 MiB/s). |
 | `--blacklist`| `id1,id2,...`| Sobrescribe la lista negra de máquinas a ignorar. |
-| `--bg`, `--background` | Ninguno | Lanza la tarea automáticamente en segundo plano con `nohup`. |
+| `--bg`, `--background` | Ninguno | Lanza la tarea automáticamente en segundo plano con `nohup` (reenvía `--keep`, `--uuid`, `--zstd`, `--bwlimit`, `--blacklist` y `--dry-run`). |
 | `--mount` | Ninguno | Monta el disco USB configurado en el punto de montaje y sale con código 0. |
 | `--umount` | Ninguno | Desmonta de forma segura el disco USB y sale con código 0. |
 | `--cron-status` | Ninguno | Muestra la tarea automática configurada en crontab y su horario legible. |
 | `--cron-remove` | Ninguno | Elimina la tarea de backup de crontab. |
 | `--telegram-test`| Ninguno | Envía un mensaje de prueba a Telegram y verifica la conexión. |
 | `-h`, `--help` | Ninguno | Muestra la ayuda rápida en la terminal. |
+
+**Código de salida:** `0` si la copia terminó sin errores y `1` si hubo algún fallo (vzdump, configuración del host, verificación de integridad, USB no montable o bloqueo ocupado), de modo que cron o un sistema de monitorización puedan detectarlo. Si la ejecución se interrumpe inesperadamente tras montar el USB, se envía una alerta por Telegram antes de desmontarlo.
+
+**Espacio libre:** antes de copiar se exige el mínimo `MIN_FREE_GB` y se compara, a modo orientativo, el tamaño de los discos seleccionados (sin comprimir) con el espacio libre del USB. Como `zstd` suele reducir bastante el tamaño, esa estimación solo genera un aviso, no detiene la copia.
 
 ### Ejemplos Prácticos de Comandos
 
@@ -232,7 +236,8 @@ scsi1: /dev/disk/by-id/ata-WDC_WD20EFRX...,backup=0
 ```
 - La **Opción 3 (Calculadora)** detecta estos discos y te avisa exactamente cuántos GB representan.
 - La **Opción 8 del Menú** te permite marcar o desmarcar `backup=0` con un clic.
-- Durante cualquier backup, si el script detecta un disco passthrough sin `backup=0`, emitirá una alerta y te ofrecerá excluirlo de forma automática.
+- Durante cualquier backup interactivo, si el script detecta un disco passthrough sin `backup=0`, emitirá una alerta y te ofrecerá excluirlo de forma automática. Con `-y` (cron) o `--dry-run` solo avisa y no modifica la configuración.
+- Las modificaciones solo afectan a la configuración actual de la máquina (nunca a las secciones de snapshots `[...]`) y conservan el resto de opciones del disco.
 
 ---
 
@@ -258,6 +263,8 @@ Un respaldo que no se ha verificado no garantiza recuperación ante desastres. E
    Prueba el flujo de compresión completo del archivo `.vma.zst` o `.tar.zst`, verificando la cabecera, los bloques de datos y los checksums internos de cada bloque.
 2. **Sumas de Verificación Criptográficas SHA-256 (`SHA256SUMS`):**
    En cada sesión de copia, se calcula el hash SHA-256 de cada archivo generado. La herramienta de verificación recalcula el hash y comprueba bit a bit que el archivo no haya sufrido "bit rot" o degradación física en los sectores del disco USB.
+
+Además, al final de cada backup se prueba automáticamente cada archivo nuevo (`zstd -t` / `tar -tzf`) **antes** de aplicar la retención: si alguno falla, la ejecución se marca como fallida y no se purgan copias antiguas.
 
 ---
 
