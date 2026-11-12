@@ -21,7 +21,7 @@ Una suite completa, interactiva y desatendida en Bash diseñada para realizar co
   - [Restaurar Contenedores (LXC)](#restaurar-contenedores-lxc)
   - [Restaurar Configuración del Host Proxmox](#restaurar-configuración-del-host-proxmox)
 - [Estructura del Almacenamiento en USB](#-estructura-del-almacenamiento-en-usb)
-- [Configuración Persistente (`/root/backup.conf`)](#-configuración-persistente)
+- [Configuración Persistente (`backup.conf` junto al script)](#-configuración-persistente)
 - [Resolución de Problemas Frecuentes](#-resolución-de-problemas-frecuentes)
 
 ---
@@ -50,7 +50,8 @@ Una suite completa, interactiva y desatendida en Bash diseñada para realizar co
   - **Telegram:** Mensajes con formato HTML que incluyen desglose de tamaño, tiempo por máquina y estado de salud.
   - **Proxmox VE (Notificaciones Nativas):** Integración directa con los destinos configurados en el panel de Proxmox (`Centro de datos -> Notificaciones`), como `Gmail-Alertas` (SMTP) o `mail-to-root` (Sendmail), vía `--notification-mode notification-system` y `--notification-target`.
   - **Email Manual (Legacy):** Soporte alternativo de envío directo mediante `--mailto`.
-- **Centro de Ayuda Integrado:** Documentación interactiva accesible directamente desde el menú del script (`Opción 12` o `h`).
+  - **Alcance real de cada canal:** el email (destino nativo de Proxmox o `--mailto`) lo envía **`vzdump`, una vez por cada VM/LXC** respaldada, y solo informa del resultado de ese `vzdump`. Los fallos del propio script (USB no montable, espacio insuficiente, bloqueo ocupado, error en la configuración del host, verificación de integridad fallida o salida inesperada) y el resumen final de la sesión **solo se notifican por Telegram**. Con Telegram desactivado (valor por defecto) esos fallos no generan ningún aviso; además, la tarea de cron que crea el script redirige la salida a `/dev/null`, por lo que cron tampoco envía correo.
+- **Centro de Ayuda Integrado:** Documentación interactiva accesible directamente desde el menú del script (tecla `?`).
 
 ---
 
@@ -114,12 +115,9 @@ Al ejecutar `./backup.sh` sin argumentos, si el disco USB ya está configurado y
  ── AUTOMATIZACIÓN, RENDIMIENTO Y DIAGNÓSTICO ──────────────────────────────────
   8)  📅 Programar Backup Automático (Configurar Cron del sistema)
   9)  ⚡ Retención, Rendimiento (ZSTD, bwlimit) y Blacklist
- 10)  🔍 Diagnóstico de Salud USB (SMART y Errores de Kernel/Disco)
- 11)  🔔 Configurar Notificaciones (Telegram y Email Proxmox)
- 12)  📜 Gestor de Logs y Centro de Ayuda (Logs en vivo o Guía [h])
-
-  h)  ❓ Abrir directamente el Centro de Ayuda Técnica
-  0)  🚪 Salir (también 'q')
+ 10)  🔔 Configurar Notificaciones (Telegram Bot y Destinos Proxmox VE)
+ 11)  🔍 Diagnóstico de Salud SMART y Kernel | 12) 📜 Visor de Logs | ?) ❓ Ayuda
+  0)  🚪 Salir (Atajos: c=Cambiar USB, f=Formatear, l=Logs, h=Salud, q=Salir)
 --------------------------------------------------------------------------------
 ```
 
@@ -136,9 +134,10 @@ Al ejecutar `./backup.sh` sin argumentos, si el disco USB ya está configurado y
 | **7) Gestionar Discos y Passthrough** | Detecta discos de VMs QEMU (incluyendo passthrough `/dev/disk/by-id/...`) y puntos de montaje de contenedores LXC (`mp0`, `mp1`...) permitiendo alternar `backup=0` (omitir) o `backup=1` (incluir). |
 | **8) Programar Backup (Cron)** | Asistente para programar la copia automática diaria o semanal en el crontab del sistema con el horario que elijas. |
 | **9) Retención y Rendimiento** | Permite cambiar la política de retención automática (`KEEP_LAST`), limitar hilos CPU ZSTD (`--zstd`), limitar ancho de banda I/O (`--bwlimit`) o gestionar la lista negra de exclusiones fijas. |
-| **10) Diagnóstico de Salud USB** | Ejecuta diagnósticos SMART sobre el disco USB y revisa el log del kernel (`dmesg`) en busca de errores I/O de disco. |
-| **11) Configurar Notificaciones** | Configura credenciales para Telegram (Token de Bot y Chat ID con prueba de envío) y vincula destinos nativos de notificación de Proxmox VE. |
-| **12) Gestor de Logs / Ayuda (`h`)** | Visualiza el archivo de log en tiempo real (`tail -f`), muestra los últimos errores, vacía el log o abre el Centro de Ayuda Técnica (también accesible pulsando `h`). |
+| **10) Configurar Notificaciones** | Configura credenciales para Telegram (Token de Bot y Chat ID con prueba de envío) y vincula destinos nativos de notificación de Proxmox VE. |
+| **11) Diagnóstico de Salud USB (`h`)** | Ejecuta diagnósticos SMART sobre el disco USB y revisa el log del kernel (`dmesg`) en busca de errores I/O de disco. |
+| **12) Visor de Logs (`l`)** | Visualiza el archivo de log en tiempo real (`tail -f`), muestra las últimas líneas o solo errores/advertencias, vacía el log o detiene un backup activo en segundo plano. |
+| **`?`) Ayuda** | Abre el Centro de Ayuda Técnica integrado. |
 
 ---
 
@@ -172,10 +171,10 @@ backup.sh [OPCIONES]
 | `--umount` | Ninguno | Desmonta de forma segura el disco USB y sale con código 0. |
 | `--cron-status` | Ninguno | Muestra la tarea automática configurada en crontab y su horario legible. |
 | `--cron-remove` | Ninguno | Elimina la tarea de backup de crontab. |
-| `--telegram-test`| Ninguno | Envía un mensaje de prueba a Telegram y verifica la conexión. |
+| `--telegram-test`| Ninguno | Envía un mensaje de prueba a Telegram. Nota: siempre imprime «Mensaje enviado.» y sale con código `0`, aunque Telegram esté desactivado o el envío falle; si `curl` falla, el motivo queda como advertencia en el log local. |
 | `-h`, `--help` | Ninguno | Muestra la ayuda rápida en la terminal. |
 
-**Código de salida:** `0` si la copia terminó sin errores y `1` si hubo algún fallo (vzdump, configuración del host, verificación de integridad, USB no montable o bloqueo ocupado), de modo que cron o un sistema de monitorización puedan detectarlo. Si la ejecución se interrumpe inesperadamente tras montar el USB, se envía una alerta por Telegram antes de desmontarlo.
+**Código de salida:** `0` si la copia terminó sin errores y `1` si hubo algún fallo (vzdump, configuración del host, verificación de integridad, USB no montable o bloqueo ocupado), de modo que cron o un sistema de monitorización puedan detectarlo. Si la ejecución se interrumpe inesperadamente tras montar el USB, se envía una alerta por Telegram (solo si está activado) antes de desmontarlo.
 
 **Espacio libre:** antes de copiar se exige el mínimo `MIN_FREE_GB` y se compara, a modo orientativo, el tamaño de los discos seleccionados (sin comprimir) con el espacio libre del USB. Como `zstd` suele reducir bastante el tamaño, esa estimación solo genera un aviso, no detiene la copia.
 
@@ -234,8 +233,8 @@ Para omitir un disco passthrough en el backup de Proxmox, se debe agregar el par
 ```text
 scsi1: /dev/disk/by-id/ata-WDC_WD20EFRX...,backup=0
 ```
-- La **Opción 3 (Calculadora)** detecta estos discos y te avisa exactamente cuántos GB representan.
-- La **Opción 8 del Menú** te permite marcar o desmarcar `backup=0` con un clic.
+- La **Opción 4 (Calculadora)** detecta estos discos y te avisa exactamente cuántos GB representan.
+- La **Opción 7 del Menú** te permite marcar o desmarcar `backup=0` con un clic.
 - Durante cualquier backup interactivo, si el script detecta un disco passthrough sin `backup=0`, emitirá una alerta y te ofrecerá excluirlo de forma automática. Con `-y` (cron) o `--dry-run` solo avisa y no modifica la configuración.
 - Las modificaciones solo afectan a la configuración actual de la máquina (nunca a las secciones de snapshots `[...]`) y conservan el resto de opciones del disco.
 
@@ -251,7 +250,7 @@ Un backup de Proxmox (`.vma.zst`) de una VM con un disco de 50 GB o 300 GB super
 - **`ext4` (Recomendado):** Sistema de archivos nativo de Linux. Ofrece máximo rendimiento, soporte completo de permisos POSIX, journaling y sin límite práctico de tamaño de archivo.
 - **`exfat`:** Recomendado únicamente si necesitas conectar con frecuencia el disco USB directamente a sistemas Windows o macOS sin software adicional.
 
-El script incluye un detector automático y el asistente de formateo en la **Opción 7**.
+El script incluye un detector automático y el asistente de formateo en la **Opción 5** (Centro de Almacenamiento USB; atajo `f`).
 
 ---
 
@@ -284,14 +283,14 @@ pct unlock <vmid>  # Para contenedores LXC
 
 ### Restaurar Máquinas Virtuales (KVM / QEMU)
 
-1. **Desde el menú interactivo:** Selecciona la **Opción 2**, elige la sesión, la VM que deseas restaurar y el almacenamiento destino (ej: `local-lvm`).
+1. **Desde el menú interactivo:** Selecciona la **Opción 3**, elige la copia, la VM que deseas restaurar y el almacenamiento destino (ej: `local-lvm`).
 2. **Desde la terminal con `qmrestore`:**
    ```bash
    # 1. Montar el disco USB
    ./backup.sh --mount
 
    # 2. Restaurar asignando un nuevo ID (o sobreescribiendo uno existente con --force 1)
-   qmrestore /media/backup/proxmox-backups/2026-10-24_01-00-00/vzdump-qemu-104-2026_10_24-01_09_24.vma.zst 104 --storage local-lvm
+   qmrestore /media/backup/dump/vzdump-qemu-104-2026_10_24-01_09_24.vma.zst 104 --storage local-lvm
 
    # 3. Desmontar al terminar
    ./backup.sh --umount
@@ -299,24 +298,24 @@ pct unlock <vmid>  # Para contenedores LXC
 
 ### Restaurar Contenedores (LXC)
 
-1. **Desde el menú interactivo:** Opción 2 del script.
+1. **Desde el menú interactivo:** Opción 3 del script.
 2. **Desde la terminal con `pct restore`:**
    ```bash
    ./backup.sh --mount
-   pct restore 105 /media/backup/proxmox-backups/2026-10-24_01-00-00/vzdump-lxc-105-2026_10_24-01_15_00.tar.zst --storage local-lvm
+   pct restore 105 /media/backup/dump/vzdump-lxc-105-2026_10_24-01_15_00.tar.zst --storage local-lvm
    ./backup.sh --umount
    ```
 
 ### Restaurar Configuración del Host Proxmox
 
-El archivo `proxmox-host-config.tar.gz` contiene los archivos de configuración del hipervisor. Para explorar su contenido:
+El archivo `proxmox-host-config-<STAMP>.tar.gz` (uno por sesión) contiene los archivos de configuración del hipervisor. Para explorar su contenido:
 ```bash
-tar -ztvf /media/backup/proxmox-backups/<FECHA>/proxmox-host-config.tar.gz
+tar -ztvf /media/backup/dump/proxmox-host-config-2026-10-24_01-00-00.tar.gz
 ```
 
 Para restaurar archivos específicos (por ejemplo, la configuración de interfaces de red):
 ```bash
-tar -xzvf /media/backup/proxmox-backups/<FECHA>/proxmox-host-config.tar.gz -C / etc/network/interfaces
+tar -xzvf /media/backup/dump/proxmox-host-config-2026-10-24_01-00-00.tar.gz -C / etc/network/interfaces
 ```
 
 ---
@@ -340,11 +339,14 @@ Las copias se almacenan en la carpeta estándar que la interfaz web de Proxmox V
 > [!TIP]
 > Al estar ubicadas en `dump/`, cualquier copia de VM o LXC aparecerá inmediatamente en la interfaz web de Proxmox bajo el almacenamiento **`backup -> Respaldos`**, permitiendo restaurar directamente con el botón **"Restaurar"** de Proxmox o desde el script.
 
+> [!WARNING]
+> Configura el storage `backup` con `is_mountpoint 1` (`pvesm set backup --is_mountpoint 1`). Si no, cuando el script desmonte el USB, Proxmox (o un job programado desde la GUI) escribirá en el disco raíz del host.
+
 ---
 
 ## 📝 Configuración Persistente
 
-Todas las preferencias se almacenan en el mismo directorio del script (`backup.conf`, puedes tomar como plantilla `backup.conf.example`):
+Todas las preferencias se almacenan en el mismo directorio del script (`backup.conf`, puedes tomar como plantilla `backup.conf.example`). Si no existe, se migra automáticamente desde `/root/backup.conf` o `/etc/proxmox-usb-backup.conf`:
 
 ```ini
 # Configuración persistente del script de backup USB Proxmox VE
@@ -365,21 +367,24 @@ NOTIFICATION_TARGET="mail-to-root"
 
 Al guardar desde el menú, los valores de texto se escriben entre comillas dobles escapando `\`, `"`, `$` y `` ` `` (sintaxis de bash), de modo que valores con comillas o barras se releen exactamente igual. Si editas el fichero a mano, también se aceptan valores sin comillas (admiten comentarios `# ...` al final) o entre comillas simples.
 
+> [!NOTE]
+> Si en `/etc/pve/storage.cfg` existe un storage llamado `backup` con `path`, ese `path` **sustituye sin aviso** al `MOUNTPOINT` de `backup.conf`. De forma análoga, si `NOTIFICATION_TARGET` está vacío se autodetecta el primer destino `smtp`/`sendmail` de `/etc/pve/notifications.cfg` (priorizando los que contienen `gmail` o `alerta`).
+
 ---
 
 ## 🛠️ Resolución de Problemas Frecuentes
 
 ### 1. `ERROR: Ya existe otra instancia de este script ejecutándose`
 - **Causa:** Quedó un proceso anterior bloqueando el archivo `backup.lock` en el directorio del script o se lanzó una tarea duplicada.
-- **Solución:** Revisa con `ps aux | grep backup.sh` o `ps aux | grep vzdump`. Si ningún proceso está en ejecución, libera el bloqueo con `rm -f /root/backup.lock` (o la ruta donde esté el script).
+- **Solución:** Revisa con `ps aux | grep backup.sh` o `ps aux | grep vzdump`. El bloqueo usa `flock` sobre `backup.lock` (junto al script) y se libera automáticamente al terminar el proceso que lo tenía: si ningún proceso está en ejecución, el bloqueo ya está libre y no hace falta borrar el fichero. Para detener una copia en curso usa `./backup.sh --stop`.
 
 ### 2. `El punto /media/backup ya está montado actualmente`
 - **Causa:** El disco quedó montado de una sesión manual previa.
-- **Solución:** Ejecuta `./backup.sh --umount` o utiliza la **Opción 4** del menú interactivo para desmontarlo con seguridad.
+- **Solución:** Ejecuta `./backup.sh --umount` o utiliza la **Opción 5** del menú interactivo (Centro de Almacenamiento USB) para desmontarlo con seguridad.
 
 ### 3. `zstd: error 70 : Write error : No space left on device`
-- **Causa 1:** El USB está formateado en FAT32 (límite de 4 GiB). Usa la **Opción 7** para formatear a `ext4`.
-- **Causa 2:** La VM contiene discos físicos directos (passthrough) de gran capacidad. Usa la **Opción 8** para marcar `backup=0` en dichos discos.
+- **Causa 1:** El USB está formateado en FAT32 (límite de 4 GiB). Usa la **Opción 5** (o el atajo `f`) para formatear a `ext4`.
+- **Causa 2:** La VM contiene discos físicos directos (passthrough) de gran capacidad. Usa la **Opción 7** para marcar `backup=0` en dichos discos.
 
 ### 4. `La máquina virtual está bloqueada (lock: backup)`
 - **Causa:** Un respaldo anterior fue cancelado a la fuerza.
