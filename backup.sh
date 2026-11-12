@@ -30,6 +30,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONFIG_FILE="${CONFIG_FILE:-$SCRIPT_DIR/backup.conf}"
 HOST_LOG_FILE="${HOST_LOG_FILE:-$SCRIPT_DIR/backup.log}"
 LOCK_FILE="${LOCK_FILE:-$SCRIPT_DIR/backup.lock}"
+CRON_LOG_FILE="${CRON_LOG_FILE:-$SCRIPT_DIR/backup-cron.log}"  # Salida completa de las ejecuciones desde cron
+CRON_LOG_MAX_BYTES=$((5 * 1024 * 1024))                         # Al superarlo se conservan solo las últimas líneas
 
 USB_UUID=""
 MOUNTPOINT="/media/backup"
@@ -49,6 +51,7 @@ TELEGRAM_CHAT_ID=""
 EMAIL_ENABLED=1
 EMAIL_NOTIFICATION_TYPE="failure" # failure | always
 NOTIFICATION_TARGET=""            # Destino nativo de Proxmox VE (se autodetecta o lee de backup.conf)
+EMAIL_TO=""                       # Destinatario de los avisos propios del script (vacío = root → reenvío de Proxmox)
 
 # Variables de ejecución
 RUN_DIR=""
@@ -297,6 +300,7 @@ load_config() {
                 EMAIL_ENABLED) EMAIL_ENABLED="$val" ;;
                 EMAIL_NOTIFICATION_TYPE) EMAIL_NOTIFICATION_TYPE="$val" ;;
                 NOTIFICATION_TARGET) NOTIFICATION_TARGET="$val" ;;
+                EMAIL_TO) EMAIL_TO="$val" ;;
                 TELEGRAM_ENABLED) TELEGRAM_ENABLED="$val" ;;
                 TELEGRAM_BOT_TOKEN) TELEGRAM_BOT_TOKEN="$val" ;;
                 TELEGRAM_CHAT_ID) TELEGRAM_CHAT_ID="$val" ;;
@@ -358,6 +362,9 @@ TELEGRAM_CHAT_ID=$(conf_quote "$TELEGRAM_CHAT_ID")
 EMAIL_ENABLED=$EMAIL_ENABLED
 EMAIL_NOTIFICATION_TYPE=$(conf_quote "$EMAIL_NOTIFICATION_TYPE")
 NOTIFICATION_TARGET=$(conf_quote "$NOTIFICATION_TARGET")
+# Destinatario de los avisos del propio script (fallos de montaje, espacio, bloqueo, verificación...).
+# Vacío = root: Proxmox lo reenvía al email de root@pam (proxmox-mail-forward)
+EMAIL_TO=$(conf_quote "$EMAIL_TO")
 EOF
     chmod 600 "$CONFIG_FILE" 2>/dev/null || true
 }
@@ -390,9 +397,48 @@ send_telegram_message() {
     return 0
 }
 
+# Convierte un mensaje con formato de Telegram (HTML y %0A) a texto plano para el email
+html_to_text() {
+    local text="${1//%0A/$'\n'}"
+    printf '%s' "$text" | sed -e 's/<[^>]*>//g' -e 's/&lt;/</g' -e 's/&gt;/>/g' -e 's/&amp;/\&/g'
+}
+
+# Envía un email con los avisos propios del script (vzdump ya envía el suyo por cada VM/LXC).
+# Usa el MTA del nodo (sendmail de postfix en Proxmox VE, o 'mail' como alternativa): el correo a root
+# lo reenvía Proxmox al email de root@pam. Nunca hace fallar al script: si no puede enviar, lo registra.
+send_email_alert() {
+    local text="$1"
+    [[ "$EMAIL_ENABLED" -eq 1 ]] || return 0
+    local to="${EMAIL_TO:-root}"
+    local body subject first_line
+    body="$(html_to_text "$text")"
+    first_line="$(printf '%s\n' "$body" | sed -n '/[^[:space:]]/{p;q}')"
+    subject="[backup-proxmox] $(hostname): ${first_line:-Aviso}"
+
+    local rc=0 out=""
+    if command -v sendmail >/dev/null 2>&1; then
+        # Asunto en UTF-8 codificado (RFC 2047) para que los emojis y acentos lleguen bien
+        local enc_subject
+        enc_subject="=?UTF-8?B?$(printf '%s' "$subject" | base64 -w0)?="
+        out="$(printf 'To: %s\nSubject: %s\nMIME-Version: 1.0\nContent-Type: text/plain; charset=UTF-8\nContent-Transfer-Encoding: 8bit\n\n%s\n' \
+            "$to" "$enc_subject" "$body" | timeout 30 sendmail -i -- "$to" 2>&1)" || rc=$?
+    elif command -v mail >/dev/null 2>&1; then
+        out="$(printf '%s\n' "$body" | timeout 30 mail -s "$subject" -- "$to" 2>&1)" || rc=$?
+    else
+        log_warn "No se pudo enviar el aviso por email: no hay 'sendmail' ni 'mail' en el sistema."
+        return 0
+    fi
+    if [[ "$rc" -ne 0 ]]; then
+        log_warn "No se pudo enviar el aviso por email a $to (código $rc): $out"
+    fi
+    return 0
+}
+
+# Avisos del propio script (fallo de montaje, espacio, bloqueo, interrupción, verificación...): Telegram + email
 send_notifications_alert() {
     local text="$1"
     send_telegram_message "$text"
+    send_email_alert "$text"
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -596,13 +642,27 @@ prune_old_backups() {
 
     for gid in "${all_gids[@]}"; do
         [[ -z "$gid" ]] && continue
-        mapfile -t g_files < <(find "$backup_path" -maxdepth 1 \( -name "vzdump-qemu-${gid}-*.vma*" -o -name "vzdump-lxc-${gid}-*.tar*" \) 2>/dev/null | sort -r)
+        # Solo archivos de copia reales (.vma / .tar / .tgz con compresión opcional): los .notes, .log,
+        # .protected y temporales (.dat, .tmp) de la misma copia no cuentan como copias adicionales.
+        # Las copias protegidas (marca <archivo>.protected desde la GUI) ni se cuentan ni se borran nunca.
+        local g_files=() cand
+        while IFS= read -r cand; do
+            [[ -z "$cand" ]] && continue
+            if [[ -e "${cand}.protected" ]]; then
+                [[ "$dry_run" -eq 1 ]] && echo -e "  ${CYAN}🔒 Protegida (no se purga):${NC} $(basename "$cand")"
+                continue
+            fi
+            g_files+=("$cand")
+        done < <(find "$backup_path" -maxdepth 1 -type f -regextype posix-extended \( \
+                    -regex ".*/vzdump-qemu-${gid}-[^/]+\\.vma(\\.(zst|gz|lzo))?" -o \
+                    -regex ".*/vzdump-lxc-${gid}-[^/]+\\.(tar|tgz)(\\.(zst|gz|lzo))?" \) 2>/dev/null | sort -r)
         local total_g=${#g_files[@]}
         if (( total_g > keep )); then
             for (( i=keep; i<total_g; i++ )); do
                 local old_arch="${g_files[$i]}"
                 local base_prefix="${old_arch%.vma*}"
                 base_prefix="${base_prefix%.tar*}"
+                base_prefix="${base_prefix%.tgz}"
                 if [[ "$dry_run" -eq 1 ]]; then
                     echo -e "  ${YELLOW}[DRY-RUN] Purgaría:${NC} $(basename "$old_arch")"
                 else
@@ -2494,6 +2554,49 @@ replace_cron_entry() {
     rm -f "$tmp_cron"
 }
 
+# Orden de cron gestionada: la salida completa se añade a CRON_LOG_FILE (antes iba a /dev/null y un fallo
+# temprano, p. ej. USB no conectado, no dejaba rastro ni aviso)
+build_cron_command() {
+    local cron_exp="$1" script_bin="$2"
+    printf '%s %q --all -y >>%q 2>&1' "$cron_exp" "$script_bin" "$CRON_LOG_FILE"
+}
+
+# Actualiza la tarea de cron creada por versiones anteriores (salida a /dev/null) al formato actual,
+# conservando su horario y la ruta del script. No hace nada si no hay tarea o ya está actualizada.
+upgrade_legacy_cron_entry() {
+    command -v crontab >/dev/null 2>&1 || return 0
+    local cline
+    cline="$(get_cron_entry)"
+    [[ -n "$cline" && "$cline" == *" --all -y >/dev/null 2>&1" ]] || return 0
+    local cron_exp script_part script_bin
+    cron_exp="$(awk '{print $1, $2, $3, $4, $5}' <<< "$cline")"
+    script_part="${cline#"$cron_exp" }"
+    script_part="${script_part% --all -y >/dev/null 2>&1}"
+    # La ruta se escribió con %q: se recupera sin evaluarla si no lleva escapes; si los lleva, se usa la actual
+    if [[ "$script_part" == *\\* ]]; then
+        script_bin="$(realpath "$0" 2>/dev/null || echo "$0")"
+    else
+        script_bin="$script_part"
+    fi
+    replace_cron_entry "$(build_cron_command "$cron_exp" "$script_bin")" 2>/dev/null || return 0
+    log_info "Tarea de cron actualizada: la salida se guarda ahora en $CRON_LOG_FILE (antes se descartaba)."
+    return 0
+}
+
+# Evita que CRON_LOG_FILE crezca sin límite: si supera CRON_LOG_MAX_BYTES conserva las últimas 5000 líneas.
+# Se reescribe en el mismo fichero (no se reemplaza) porque cron puede tenerlo abierto en modo append.
+rotate_cron_log() {
+    [[ -f "$CRON_LOG_FILE" ]] || return 0
+    local size
+    size="$(stat -c %s "$CRON_LOG_FILE" 2>/dev/null || echo 0)"
+    (( size > CRON_LOG_MAX_BYTES )) || return 0
+    local tmp
+    tmp="$(mktemp)" || return 0
+    tail -n 5000 "$CRON_LOG_FILE" > "$tmp" 2>/dev/null && cat "$tmp" > "$CRON_LOG_FILE" 2>/dev/null
+    rm -f "$tmp"
+    return 0
+}
+
 format_cron_human() {
     local cline="$1"
     [[ -z "$cline" ]] && { echo "Desactivado"; return; }
@@ -2626,7 +2729,7 @@ menu_cron_schedule() {
 
         if [[ -n "$new_cron_exp" ]]; then
             # Ruta del script entrecomillada (%q) por si contiene espacios u otros caracteres especiales
-            replace_cron_entry "$(printf '%s %q --all -y >/dev/null 2>&1' "$new_cron_exp" "$script_bin")"
+            replace_cron_entry "$(build_cron_command "$new_cron_exp" "$script_bin")"
 
             echo -e "\n${GREEN}✓ ¡Tarea programada guardada con éxito en crontab!${NC}"
             echo -e "Horario configurado: ${BOLD}$(format_cron_human "$new_cron_exp")${NC}"
@@ -3045,6 +3148,7 @@ execute_backup_engine() {
     motor_montar_destino
     motor_seleccionar_elementos
     motor_filtrar_lista_negra
+    motor_validar_seleccion
     motor_comprobar_passthrough
     motor_estimar_espacio
     motor_preparar_directorio
@@ -3170,10 +3274,19 @@ motor_seleccionar_elementos() {
         ENGINE_DO_HOST=1
     elif [[ -n "$CLI_SELECTED_GUESTS" ]]; then
         IFS=',' read -ra REQ_IDS <<< "$CLI_SELECTED_GUESTS"
+        local missing_ids=()
         for rid in "${REQ_IDS[@]}"; do
             rid="$(echo "$rid" | tr -d ' ')"
-            [[ -n "${GUEST_TYPES[$rid]:-}" ]] && ENGINE_SELECTED+=("$rid")
+            [[ -z "$rid" ]] && continue
+            if [[ -n "${GUEST_TYPES[$rid]:-}" ]]; then
+                ENGINE_SELECTED+=("$rid")
+            else
+                missing_ids+=("$rid")
+            fi
         done
+        if [[ ${#missing_ids[@]} -gt 0 ]]; then
+            abort "Los IDs indicados con --vms no existen en este nodo: ${missing_ids[*]}. Revisa 'qm list' y 'pct list'."
+        fi
         if [[ "$CLI_INCLUDE_HOST" -eq 1 ]]; then
             ENGINE_DO_HOST=1
         else
@@ -3231,7 +3344,12 @@ motor_seleccion_interactiva() {
             IFS=',' read -ra REQ_SUB <<< "$raw_sub_ids"
             for rid in "${REQ_SUB[@]}"; do
                 rid="$(echo "$rid" | tr -d ' ')"
-                [[ -n "${GUEST_TYPES[$rid]:-}" ]] && ENGINE_SELECTED+=("$rid")
+                [[ -z "$rid" ]] && continue
+                if [[ -n "${GUEST_TYPES[$rid]:-}" ]]; then
+                    ENGINE_SELECTED+=("$rid")
+                else
+                    echo -e "${YELLOW}⚠️ El ID $rid no existe en este nodo: se ignora.${NC}"
+                fi
             done
             if ask_yes_no "¿Incluir configuración del Host Proxmox?" "n"; then
                 ENGINE_DO_HOST=1
@@ -3276,6 +3394,15 @@ motor_filtrar_lista_negra() {
             log_info "Omitiendo elementos en lista negra: ${bl_omitted[*]}"
             ENGINE_SELECTED=("${bl_filtered[@]}")
         fi
+    fi
+    return 0
+}
+
+# Fase 3.2: si tras la selección y la lista negra no queda nada (ni VMs/LXCs ni host), no hay copia que hacer:
+# se aborta con error en vez de terminar con "ÉXITO" sin haber respaldado nada
+motor_validar_seleccion() {
+    if [[ ${#ENGINE_SELECTED[@]} -eq 0 && "$ENGINE_DO_HOST" -ne 1 ]]; then
+        abort "No hay nada que respaldar: ninguna VM/LXC seleccionada (o todas están en la lista negra) y el host excluido."
     fi
     return 0
 }
@@ -3564,7 +3691,8 @@ motor_mostrar_resumen() {
     return 0
 }
 
-# Fase 13: notificación final por Telegram (éxito o fallo con el desglose); en fallo marca ALERT_SENT=1
+# Fase 13: notificación final (éxito o fallo con el desglose). El fallo va por Telegram y email;
+# el éxito por Telegram y, con EMAIL_NOTIFICATION_TYPE=always, también por email. En fallo marca ALERT_SENT=1
 motor_notificar_resultado() {
     if [[ "$FAILED" -eq 0 ]]; then
         local tg_msg="✅ <b>Backup Proxmox VE Completado</b>%0A%0A"
@@ -3579,7 +3707,9 @@ motor_notificar_resultado() {
             tg_msg+="• <code>$(html_escape "$rep_line")</code>%0A"
         done
         send_telegram_message "$tg_msg"
-        log_info "Notificación de éxito enviada a Telegram."
+        # En modo 'always' también se envía el resumen por email (en 'failure' solo los fallos)
+        [[ "$EMAIL_NOTIFICATION_TYPE" == "always" ]] && send_email_alert "$tg_msg"
+        log_info "Notificación de éxito enviada (Telegram$([[ "$EMAIL_NOTIFICATION_TYPE" == "always" && "$EMAIL_ENABLED" -eq 1 ]] && echo " y email"))."
     else
         local tg_err="⚠️ <b>Fallo en Backup Proxmox VE</b>%0A%0A"
         tg_err+="• <b>Host:</b> $(html_escape "$(hostname)")%0A"
@@ -3589,8 +3719,8 @@ motor_notificar_resultado() {
         for rep_line in "${ENGINE_SUMMARY_REPORT[@]}"; do
             tg_err+="• <code>$(html_escape "$rep_line")</code>%0A"
         done
-        send_telegram_message "$tg_err"
-        log_err "Notificación de fallo enviada a Telegram."
+        send_notifications_alert "$tg_err"
+        log_err "Notificación de fallo enviada (Telegram y email, según la configuración)."
         ALERT_SENT=1
     fi
     return 0
@@ -4074,6 +4204,7 @@ main_menu() {
 # Procesamiento de Argumentos CLI (Automatización / Cron)
 # ─────────────────────────────────────────────────────────────────────────────
 show_help() {
+    local rc="${1:-0}"
     cat <<EOF
 Uso: $0 [OPCIONES]
 
@@ -4115,12 +4246,37 @@ Ejemplos:
   $0 --mount                 # Monta manualmente el disco USB
   $0 --umount                # Desmonta de forma segura el disco USB
   $0 --cron-status           # Consulta el horario programado en cron
+
+Códigos de salida: 0 = correcto · 1 = la copia falló o no pudo empezar · 2 = opciones no válidas
 EOF
-    exit 0
+    exit "$rc"
+}
+
+# Error de uso en la línea de comandos: mensaje por stderr y salida con código 2 (cron lo detecta)
+cli_usage_error() {
+    echo "ERROR: $*" >&2
+    echo "Usa '$0 --help' para ver las opciones disponibles." >&2
+    exit 2
+}
+
+# Comprueba que una opción que necesita valor lo recibe (y que no es otra opción, p. ej. '--keep --all')
+cli_require_value() {
+    local opt="$1"
+    if [[ $# -lt 2 || -z "$2" || "$2" == -* ]]; then
+        cli_usage_error "La opción $opt necesita un valor."
+    fi
+}
+
+cli_require_number() {
+    local opt="$1" val="$2"
+    [[ "$val" =~ ^[0-9]+$ ]] || cli_usage_error "La opción $opt necesita un número entero (recibido: '$val')."
 }
 
 # Procesar argumentos si existen
 load_config
+# Migrar la tarea de cron de versiones anteriores (salida a /dev/null) y acotar el tamaño de su log
+upgrade_legacy_cron_entry || true
+rotate_cron_log || true
 if [[ $# -gt 0 ]]; then
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -4128,14 +4284,14 @@ if [[ $# -gt 0 ]]; then
             -y|--yes) CLI_YES=1; shift ;;
             -n|--dry-run) CLI_DRY_RUN=1; shift ;;
             --host-only) CLI_HOST_ONLY=1; shift ;;
-            --vms) CLI_SELECTED_GUESTS="$2"; shift 2 ;;
+            --vms) cli_require_value "$@"; [[ "$2" =~ ^[0-9]+([[:space:]]*,[[:space:]]*[0-9]+)*$ ]] || cli_usage_error "La opción --vms necesita IDs numéricos separados por comas (recibido: '$2')."; CLI_SELECTED_GUESTS="$2"; shift 2 ;;
             --with-host) CLI_INCLUDE_HOST=1; shift ;;
             --no-host) CLI_INCLUDE_HOST=0; shift ;;
-            --keep) KEEP_LAST="$2"; shift 2 ;;
-            --uuid) USB_UUID="$2"; shift 2 ;;
-            --zstd) ZSTD_THREADS="$2"; shift 2 ;;
-            --bwlimit) BWLIMIT="$2"; shift 2 ;;
-            --blacklist) BLACKLIST_VMS="$2"; shift 2 ;;
+            --keep) cli_require_value "$@"; cli_require_number "$1" "$2"; KEEP_LAST="$2"; shift 2 ;;
+            --uuid) cli_require_value "$@"; USB_UUID="$2"; shift 2 ;;
+            --zstd) cli_require_value "$@"; cli_require_number "$1" "$2"; ZSTD_THREADS="$2"; shift 2 ;;
+            --bwlimit) cli_require_value "$@"; cli_require_number "$1" "$2"; BWLIMIT="$2"; shift 2 ;;
+            --blacklist) cli_require_value "$@"; [[ "$2" =~ ^[0-9]+([[:space:]]*,[[:space:]]*[0-9]+)*$ ]] || cli_usage_error "La opción --blacklist necesita IDs numéricos separados por comas (recibido: '$2')."; BLACKLIST_VMS="$2"; shift 2 ;;
             --bg|--background) CLI_BACKGROUND=1; shift ;;
             --stop|--kill) CLI_STOP=1; shift ;;
             --mount)
@@ -4180,10 +4336,11 @@ if [[ $# -gt 0 ]]; then
                 echo "Mensaje enviado."
                 exit 0
                 ;;
-            -h|--help) show_help ;;
+            -h|--help) show_help 0 ;;
             *)
-                echo "Opción desconocida: $1"
-                show_help
+                echo "ERROR: Opción desconocida: $1" >&2
+                echo >&2
+                show_help 2 >&2
                 ;;
         esac
     done

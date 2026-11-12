@@ -29,3 +29,4 @@ TELEGRAM_CHAT_ID=""
 EMAIL_ENABLED=1
 EMAIL_NOTIFICATION_TYPE="failure"   # failure | always
 NOTIFICATION_TARGET=""              # Ej: mail-to-root o nombre del destino SMTP en Proxmox
+EMAIL_TO=""                         # Destinatario de los avisos del propio script (vacío = root → email de root@pam)

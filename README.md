@@ -45,12 +45,14 @@ Una suite completa, interactiva y desatendida en Bash diseñada para realizar co
   - Control de ancho de banda I/O (`--bwlimit`, por defecto `70000` KiB/s) para no degradar el rendimiento del servidor en producción.
   - Exclusión permanente de VMs/LXCs no deseados en backups desatendidos.
 - **Desbloqueo Automático:** Detección y limpieza automática de bloqueos huérfanos (`qm unlock` / `pct unlock`) causados por caídas eléctricas o desconexiones previas.
-- **Política de Retención Automática (`KEEP_LAST`):** Conserva las últimas $N$ copias por máquina/host y purga de forma segura las más antiguas manteniendo limpio el archivo `SHA256SUMS`.
+- **Política de Retención Automática (`KEEP_LAST`):** Conserva las últimas $N$ copias por máquina/host y purga de forma segura las más antiguas manteniendo limpio el archivo `SHA256SUMS`. Solo cuenta los archivos de copia reales (`.vma` / `.tar` / `.tgz`, con compresión `zst`, `gz` o `lzo` opcional): los `.notes`, `.log`, `.protected` y temporales de `vzdump` no cuentan como copias. Las copias **protegidas** desde la GUI de Proxmox (marca `.protected`) nunca se borran ni cuentan para `KEEP_LAST`.
 - **Notificaciones Ricas:**
   - **Telegram:** Mensajes con formato HTML que incluyen desglose de tamaño, tiempo por máquina y estado de salud.
   - **Proxmox VE (Notificaciones Nativas):** Integración directa con los destinos configurados en el panel de Proxmox (`Centro de datos -> Notificaciones`), como `Gmail-Alertas` (SMTP) o `mail-to-root` (Sendmail), vía `--notification-mode notification-system` y `--notification-target`.
   - **Email Manual (Legacy):** Soporte alternativo de envío directo mediante `--mailto`.
-  - **Alcance real de cada canal:** el email (destino nativo de Proxmox o `--mailto`) lo envía **`vzdump`, una vez por cada VM/LXC** respaldada, y solo informa del resultado de ese `vzdump`. Los fallos del propio script (USB no montable, espacio insuficiente, bloqueo ocupado, error en la configuración del host, verificación de integridad fallida o salida inesperada) y el resumen final de la sesión **solo se notifican por Telegram**. Con Telegram desactivado (valor por defecto) esos fallos no generan ningún aviso; además, la tarea de cron que crea el script redirige la salida a `/dev/null`, por lo que cron tampoco envía correo.
+  - **Avisos del propio script por email:** con `EMAIL_ENABLED=1` (valor por defecto), los fallos del script (USB no montable, espacio insuficiente, bloqueo ocupado, error en la configuración del host, verificación de integridad fallida, IDs inexistentes o salida inesperada) se envían **también por email**, además de por Telegram si está activado. Se usa el MTA del nodo (`sendmail` de Postfix en Proxmox VE, o `mail` como alternativa) y van a `EMAIL_TO` o, si está vacío, a `root`, que Proxmox reenvía al email de `root@pam`. Con `EMAIL_NOTIFICATION_TYPE="always"` también se envía por email el resumen de las copias correctas. Si no hay MTA o el envío falla, queda una advertencia en el log y la copia continúa.
+  - **Email de `vzdump`:** además, `vzdump` envía su propio email **una vez por cada VM/LXC** respaldada, con el resultado de esa copia (destino nativo de Proxmox o `--mailto`).
+  - **Registro de cron:** la tarea de cron que crea el script guarda toda la salida en `backup-cron.log`, junto al script (si supera 5 MiB se conservan las últimas 5000 líneas). Las tareas creadas con versiones anteriores, que enviaban la salida a `/dev/null`, se actualizan solas la próxima vez que se ejecuta el script.
 - **Centro de Ayuda Integrado:** Documentación interactiva accesible directamente desde el menú del script (tecla `?`).
 
 ---
@@ -132,7 +134,7 @@ Al ejecutar `./backup.sh` sin argumentos, si el disco USB ya está configurado y
 | **5) Centro de Almacenamiento USB** | Permite montar o desmontar la unidad con `sync`, cambiar de disco USB (escaneo por UUID) o formatear a `ext4` / `exfat` mediante el asistente seguro con confirmación `FORMATEAR`. |
 | **6) Explorar / Verificar / Borrar** | Muestra una tabla compacta de las copias en el USB con barra de capacidad, permite borrar copias individuales, aplicar la retención o ejecutar el **Test de Integridad** (`t <Nº>` o `t all`). |
 | **7) Gestionar Discos y Passthrough** | Detecta discos de VMs QEMU (incluyendo passthrough `/dev/disk/by-id/...`) y puntos de montaje de contenedores LXC (`mp0`, `mp1`...) permitiendo alternar `backup=0` (omitir) o `backup=1` (incluir). |
-| **8) Programar Backup (Cron)** | Asistente para programar la copia automática diaria o semanal en el crontab del sistema con el horario que elijas. |
+| **8) Programar Backup (Cron)** | Asistente para programar la copia automática diaria o semanal en el crontab del sistema con el horario que elijas. La salida de cada ejecución se guarda en `backup-cron.log`, junto al script. |
 | **9) Retención y Rendimiento** | Permite cambiar la política de retención automática (`KEEP_LAST`), limitar hilos CPU ZSTD (`--zstd`), limitar ancho de banda I/O (`--bwlimit`) o gestionar la lista negra de exclusiones fijas. |
 | **10) Configurar Notificaciones** | Configura credenciales para Telegram (Token de Bot y Chat ID con prueba de envío) y vincula destinos nativos de notificación de Proxmox VE. |
 | **11) Diagnóstico de Salud USB (`h`)** | Ejecuta diagnósticos SMART sobre el disco USB y revisa el log del kernel (`dmesg`) en busca de errores I/O de disco. |
@@ -156,7 +158,7 @@ backup.sh [OPCIONES]
 | `-a`, `--all` | Ninguno | Respalda automáticamente todas las VMs, Contenedores LXC y la configuración del Host. |
 | `-y`, `--yes` | Ninguno | Omite cualquier pregunta interactiva (asume respuesta afirmativa 'SÍ'). Por seguridad, nunca modifica `/etc/pve` (discos passthrough sin `backup=0`: solo avisa). |
 | `-n`, `--dry-run` | Ninguno | Simula todo el proceso de copia, comandos `vzdump` y purga de retención sin escribir ni borrar datos reales. |
-| `--vms` | `id1,id2,...` | Especifica una lista separada por comas de IDs a respaldar (ej: `--vms 100,104`). |
+| `--vms` | `id1,id2,...` | Especifica una lista separada por comas de IDs a respaldar (ej: `--vms 100,104`). Si algún ID no existe en el nodo, la copia no empieza y se notifica el error. |
 | `--with-host` | Ninguno | Incluye el respaldo del host al usar `--vms`. |
 | `--no-host` | Ninguno | Excluye el respaldo del host al usar `--vms` o `--all`. |
 | `--host-only` | Ninguno | Respalda únicamente la configuración del host Proxmox (omite VMs y LXCs). |
@@ -174,7 +176,12 @@ backup.sh [OPCIONES]
 | `--telegram-test`| Ninguno | Envía un mensaje de prueba a Telegram. Nota: siempre imprime «Mensaje enviado.» y sale con código `0`, aunque Telegram esté desactivado o el envío falle; si `curl` falla, el motivo queda como advertencia en el log local. |
 | `-h`, `--help` | Ninguno | Muestra la ayuda rápida en la terminal. |
 
-**Código de salida:** `0` si la copia terminó sin errores y `1` si hubo algún fallo (vzdump, configuración del host, verificación de integridad, USB no montable o bloqueo ocupado), de modo que cron o un sistema de monitorización puedan detectarlo. Si la ejecución se interrumpe inesperadamente tras montar el USB, se envía una alerta por Telegram (solo si está activado) antes de desmontarlo.
+**Código de salida**, para que cron o un sistema de monitorización puedan detectar los fallos:
+- `0`: la copia terminó sin errores.
+- `1`: hubo algún fallo (vzdump, configuración del host, verificación de integridad, USB no montable, bloqueo ocupado, IDs de `--vms` inexistentes o nada que respaldar porque todo quedó excluido).
+- `2`: opciones no válidas (opción desconocida, opción sin su valor como `--keep` o `--keep --all`, o valor no numérico en `--keep`, `--zstd`, `--bwlimit`, `--vms` o `--blacklist`). El error y la ayuda se muestran por la salida de errores y no se hace ninguna copia.
+
+Si la ejecución se interrumpe inesperadamente tras montar el USB, se envía una alerta (Telegram y email, según la configuración) antes de desmontarlo.
 
 **Espacio libre:** antes de copiar se exige el mínimo `MIN_FREE_GB` y se compara, a modo orientativo, el tamaño de los discos seleccionados (sin comprimir) con el espacio libre del USB. Como `zstd` suele reducir bastante el tamaño, esa estimación solo genera un aviso, no detiene la copia.
 
@@ -363,6 +370,7 @@ TELEGRAM_CHAT_ID="987654321"
 EMAIL_ENABLED=1
 EMAIL_NOTIFICATION_TYPE="failure"
 NOTIFICATION_TARGET="mail-to-root"
+EMAIL_TO=""                 # Destinatario de los avisos del script (vacío = root)
 ```
 
 Al guardar desde el menú, los valores de texto se escriben entre comillas dobles escapando `\`, `"`, `$` y `` ` `` (sintaxis de bash), de modo que valores con comillas o barras se releen exactamente igual. Si editas el fichero a mano, también se aceptan valores sin comillas (admiten comentarios `# ...` al final) o entre comillas simples.
